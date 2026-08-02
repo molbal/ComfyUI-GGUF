@@ -6,7 +6,6 @@ import collections
 import json
 import os
 from contextlib import nullcontext
-from tqdm import tqdm
 
 import nodes
 import comfy.sd
@@ -19,7 +18,15 @@ import comfy.model_management
 import comfy.memory_management
 import folder_paths
 
-from .ops import GGMLTensor, GGMLOps, get_gguf_q8_ops, get_gguf_q4_w4a4_ops, move_patch_to_device
+from .ops import (
+    GGMLTensor,
+    GGMLOps,
+    get_gguf_q8_ops,
+    get_gguf_q4_w4a4_ops,
+    int4_lora_offload_enabled,
+    log_cuda_oom_loaded_models,
+    move_patch_to_device,
+)
 from .loader import gguf_sd_loader, gguf_clip_loader, gguf_tensor_count
 from .dequant import dequantize_tensor, is_quantized, is_torch_compatible
 from .tools.convert import (
@@ -31,6 +38,9 @@ from .tools.convert import (
     convert_file,
 )
 from .lora import load_gguf_lora
+
+
+_DYNAMIC_VRAM_LORA_WARNING_MIN_BYTES = 64 * 1024 * 1024
 
 
 def update_folder_names_and_paths(key, targets=[]):
@@ -93,7 +103,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 move(device)
 
     def _prepare_gguf_quantized_weights(self, device=None):
-        """Prepare all active INT4 adapter fusions before the model is used."""
+        """Eagerly prepare fallback caches for active, non-native INT4 patches."""
         prepared = []
         layout = []
         active_modules = []
@@ -114,11 +124,8 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         self._gguf_patch_layout_signature = layout
 
         if device is None:
-            # Fusion is a compute-heavy operation.  Use the device where the
-            # model will execute rather than the offload device, which is
-            # commonly CPU for Dynamic VRAM models.  The latter remains the
-            # fallback for older/custom patchers that do not expose a load
-            # device.
+            # Fallback cache preparation is compute-heavy. Use the execution
+            # device rather than Dynamic VRAM's commonly-CPU offload device.
             device = getattr(self, "load_device", None)
         if device is None:
             device = getattr(self, "offload_device", None)
@@ -131,27 +138,18 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         device_context = cuda_context(device) if callable(cuda_context) else nullcontext()
         try:
             with device_context:
-                with tqdm(
-                    total=len(active_modules),
-                    desc=f"Fusing INT4 LoRA ({device})",
-                    unit="layer",
-                    dynamic_ncols=True,
-                ) as progress:
-                    for name, module in active_modules:
-                        if interrupt is not None:
-                            interrupt()
-                        progress.set_postfix_str(name, refresh=False)
-                        if module.prepare_fused_weight(device):
-                            prepared.append(module)
-                            # Patched INT4 layers retain a full-precision matrix for
-                            # correctness. Stage each completed matrix back to the
-                            # offload device so all 256 layers do not accumulate on
-                            # the execution GPU during model loading.
-                            move = getattr(module, "move_fused_caches", None)
-                            offload_device = getattr(self, "offload_device", None)
-                            if move is not None and offload_device is not None and device != offload_device:
-                                move(offload_device)
-                        progress.update(1)
+                for _, module in active_modules:
+                    if interrupt is not None:
+                        interrupt()
+                    if module.prepare_fused_weight(device):
+                        prepared.append(module)
+                        # Fallback-patched INT4 layers retain a full-precision matrix
+                        # for correctness. Stage it on the offload device so all
+                        # layers do not accumulate on the execution GPU at load time.
+                        move = getattr(module, "move_fused_caches", None)
+                        offload_device = getattr(self, "offload_device", None)
+                        if move is not None and offload_device is not None and device != offload_device:
+                            move(offload_device)
         except BaseException:
             # Do not leave a mixture of old and newly fused representations after
             # an interrupt or a failed adapter preparation.
@@ -815,6 +813,142 @@ class GGUFModelPatcherDynamic(comfy.model_patcher.ModelPatcherDynamic):
     _move_gguf_quantized_caches = GGUFModelPatcher._move_gguf_quantized_caches
     _prepare_gguf_quantized_weights = GGUFModelPatcher._prepare_gguf_quantized_weights
 
+    def _dynamic_vram_lora_cpu_factors(self):
+        """Return CPU LoRA/LoKr factors and adapters from active low-VRAM patches."""
+        execution_device = torch.device(getattr(self, "load_device", "cpu"))
+        offload_device = torch.device(getattr(self, "offload_device", "cpu"))
+        if execution_device.type != "cuda" or offload_device.type != "cpu":
+            return execution_device, offload_device, {}, ()
+
+        factors = {}
+        adapters = {}
+        for _, module in self.model.named_modules():
+            functions = (
+                *getattr(module, "weight_function", ()),
+                *getattr(module, "bias_function", ()),
+            )
+            for patch_function in functions:
+                if not getattr(patch_function, "is_lowvram_patch", False):
+                    continue
+                patches = getattr(patch_function, "patches", None)
+                key = getattr(patch_function, "key", None)
+                patch_entries = getattr(patch_function, "prepared_patches", None)
+                if patch_entries is None and patches is not None and key is not None:
+                    patch_entries = patches.get(key)
+                if patch_entries is None:
+                    continue
+                for patch in patch_entries:
+                    if len(patch) < 2:
+                        continue
+                    adapter = patch[1]
+                    if getattr(adapter, "name", None) not in {"lora", "lokr"}:
+                        continue
+                    has_cpu_factor = False
+                    for factor in getattr(adapter, "weights", ()):
+                        if isinstance(factor, torch.Tensor) and factor.device.type == "cpu":
+                            factors[id(factor)] = factor
+                            has_cpu_factor = True
+                    if has_cpu_factor:
+                        adapters[id(adapter)] = adapter
+        return execution_device, offload_device, factors, tuple(adapters.values())
+
+    def _move_dynamic_vram_lora_factor(self, factor, device):
+        return factor.to(device)
+
+    def _preload_dynamic_vram_lora_factors(self):
+        """Atomically place active low-VRAM LoRA/LoKr factors on the execution GPU."""
+        execution_device, _, factors, adapters = (
+            GGUFModelPatcherDynamic._dynamic_vram_lora_cpu_factors(self)
+        )
+        if not factors or not torch.cuda.is_available():
+            return False
+
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(execution_device)
+        except RuntimeError:
+            return False
+
+        factor_bytes = sum(
+            factor.numel() * factor.element_size() for factor in factors.values()
+        )
+        if (
+            int4_lora_offload_enabled()
+            and free_bytes - factor_bytes < comfy.model_management.extra_reserved_memory()
+        ):
+            return False
+
+        transferred = {}
+        try:
+            for factor in factors.values():
+                transferred[id(factor)] = self._move_dynamic_vram_lora_factor(
+                    factor, execution_device
+                )
+        except torch.OutOfMemoryError:
+            transferred.clear()
+            log_cuda_oom_loaded_models("preloading Dynamic VRAM INT4 LoRA/LoKr factors")
+            raise
+
+        for adapter in adapters:
+            adapter.weights = tuple(
+                transferred.get(id(weight), weight)
+                if isinstance(weight, torch.Tensor)
+                else weight
+                for weight in adapter.weights
+            )
+        logging.info(
+            "Dynamic VRAM preloaded %d unique LoRA/LoKr factor tensors (%.1f MiB) on %s.",
+            len(factors),
+            factor_bytes / 1024**2,
+            execution_device,
+        )
+        return True
+
+    def _warn_dynamic_vram_lora_streaming(self):
+        """Warn when active low-VRAM LoRA/LoKr factors must stream to CUDA repeatedly."""
+        if not int4_lora_offload_enabled():
+            return False
+        execution_device, offload_device, factors, _ = (
+            GGUFModelPatcherDynamic._dynamic_vram_lora_cpu_factors(self)
+        )
+        if execution_device.type != "cuda" or offload_device.type != "cpu":
+            return False
+
+        factor_bytes = sum(factor.numel() * factor.element_size() for factor in factors.values())
+        if factor_bytes < _DYNAMIC_VRAM_LORA_WARNING_MIN_BYTES:
+            return False
+
+        signature = (
+            tuple(sorted((id(factor), factor.numel(), factor.element_size()) for factor in factors.values())),
+            str(execution_device),
+            str(offload_device),
+        )
+        if getattr(self, "_gguf_lora_stream_warning_signature", None) == signature:
+            return False
+
+        memory_report = "CUDA memory telemetry unavailable"
+        if torch.cuda.is_available():
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info(execution_device)
+            except RuntimeError:
+                pass
+            else:
+                memory_report = (
+                    f"CUDA free/total {free_bytes / 1024**3:.1f}/{total_bytes / 1024**3:.1f} GiB"
+                )
+        logging.warning(
+            "Dynamic VRAM runtime LoRA/LoKr warning: %.1f MiB across %d unique offloaded "
+            "LoRA/LoKr factor tensors may be repeatedly streamed from %s to %s (%s). "
+            "This can cause severe slowdown and increase CUDA OOM risk, but does not "
+            "guarantee an OOM.",
+            factor_bytes / 1024**2,
+            len(factors),
+            offload_device,
+            execution_device,
+            memory_report,
+        )
+        self._gguf_lora_stream_warning_signature = signature
+        return True
+
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         if unpatch_weights:
             self._evict_gguf_quantized_caches()
@@ -840,6 +974,8 @@ class GGUFModelPatcherDynamic(comfy.model_patcher.ModelPatcherDynamic):
                     functions = getattr(module, f"{param_key}_function", [])
                     functions.append(lowvram_function)
                     setattr(module, f"{param_key}_function", functions)
+        self._preload_dynamic_vram_lora_factors()
+        self._warn_dynamic_vram_lora_streaming()
         self._prepare_gguf_quantized_weights()
 
     def clone(self, disable_dynamic=False, model_override=None):

@@ -1,6 +1,6 @@
 # ComfyUI-GGUF Architecture & Technical Details
 
-This document covers the engineering details behind ComfyUI-GGUF, including the custom `Q8_CR` native INT8 layout, target-size quantization fallback algorithms, dynamic patch behavior, and the dequantization cache utilized for LoRA exports.
+This document covers the engineering details behind ComfyUI-GGUF, including the custom `Q8_CR` native INT8 layout, target-size quantization fallback algorithms, dynamic patch behavior, and fallback caches for non-native adapter patches.
 
 ## Native Weight-Only Quantization (Q8_CR)
 
@@ -50,12 +50,17 @@ The fallback logic operates as follows:
 
 Imported GGUF LoRAs retain normal dynamic-patch behavior to ensure maximum compatibility. Because of this, an active LoRA prevents `Q8_CR` Linear layers from utilizing their native INT8 fast path. 
 
-The experimental `Q4_CR_W4A4` pipeline addresses this by utilizing a dequantization cache:
-1. It dequantizes the active adapter target dynamically.
-2. It applies the adapter mathematically within the designated compute dtype.
-3. It caches the patched floating-point weight in memory while the model remains loaded.
-4. It evicts the derived quantized caches automatically when the underlying model or LoRA patch layout changes.
+For `Q4_CR_W4A4`, compatible standard LoRA and LoKr patches keep the packed INT4 base and add an exact low-rank output correction. They do not fuse or cache a full floating-point weight. Other patch forms that cannot use this bypass fall back to a compute-dtype cache:
+1. It dequantizes the target and applies the patch in the compute dtype.
+2. It caches the resulting patched floating-point weight while the model remains loaded.
+3. It evicts the derived caches when the model or patch layout changes.
 
-Retaining the patched weight in floating-point memory is mandatory because minor LoRA deltas evaporate mathematically if an already-quantized matrix undergoes re-quantization back to INT4. 
+If a patched INT4 layer exhausts CUDA memory during execution, the layer retries in
+system memory: the packed base is dequantized on the CPU, the adapter is applied
+there, and only the completed output is copied back to the execution device. This
+reduces the transient CUDA peak but cannot avoid the final output allocation needed
+by the following GPU layer.
+
+The fallback cache remains floating-point because re-quantizing a patched matrix to INT4 can erase small deltas. Compatible standard LoRA and LoKr avoid that cache through their low-rank bypass.
 
 For fixed adapter combinations, developers should merge adapters statically during export. Running `tools/convert.py --lora path/to/adapter.safetensors` fuses the parameters prior to quantization. Using the **Targeted Quantization (GGUF)** node's `streamed` input flag reads, fuses, quantizes, and stages one tensor block at a time to aggressively minimize peak RAM consumption.

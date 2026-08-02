@@ -29,9 +29,7 @@ git clone https://github.com/molbal/ComfyUI-GGUF
 ## Usage  
   
 Simply use the GGUF Unet loader found under the `bootleg` category. Place the .gguf model files in your `ComfyUI/models/unet` folder.  
-  
-LoRA loading is experimental but it should work with just the built-in LoRA loader node(s).  
-  
+
 Pre-quantized models (🍴 icon on ones added by this fork):  
   
 - [flux1-dev GGUF](https://huggingface.co/city96/FLUX.1-dev-gguf)  
@@ -68,62 +66,14 @@ Each option is documented here: [Quantizing models](https://molbal.github.io/ggu
 
 ## Supported Conversion Formats
 
-**Format**
-
-**Storage / execution**
-
-**Recommended use**
-
-**F16**
-
-FP16 GGUF
-
-Maximum compatibility with half-precision storage.
-
-**BF16**
-
-BF16 GGUF
-
-Preserve BF16 source models where the target supports BF16.
-
-**Q8_0**
-
-Standard GGML 8-bit
-
-Excellent general-quality 8-bit GGUF.
-
-**Q5_1**
-
-Standard GGML 5-bit
-
-Lower storage with a quality-oriented 5-bit format.
-
-**Q5_0**
-
-Standard GGML 5-bit
-
-Lower storage alternative to `Q5_1`.
-
-**Q4_1**
-
-Standard GGML 4-bit
-
-Smaller files when VRAM or RAM is constrained.
-
-**Q4_0**
-
-Standard GGML 4-bit
-
-Smallest supported format for constrained setups.
-
-**Q8_CR**
-
-Per-row INT8 ConvRot
-
-Maintainer recommendation for NVIDIA RTX 30-series systems.
-
-**Q4_CR**
-
-INT4 ConvRot
-
-Maintainer recommendation for NVIDIA RTX 30-series systems.
+| Format | Storage / execution       | Recommended use                                             |
+|--------|---------------------------|-------------------------------------------------------------|
+| F16    | FP16 GGUF                 | Maximum compatibility with half-precision storage.          |
+| BF16   | BF16 GGUF                 | Preserve BF16 source models where the target supports BF16. |
+| Q8_0   | Standard GGML 8-bit       | Excellent general-quality 8-bit GGUF.                       |
+| Q5_1   | Standard GGML 5-bit       | Lower storage with a quality-oriented 5-bit format.         |
+| Q5_0   | Standard GGML 5-bit       | Lower storage alternative to `Q5_1`.                        |
+| Q4_1   | Standard GGML 4-bit       | Smaller files when VRAM or RAM is constrained.              |
+| Q4_0   | Standard GGML 4-bit       | Smallest supported format for constrained setups.           |
+| Q8_CR  | Per-row INT8 ConvRot      | Maintainer recommendation for NVIDIA RTX 30-series systems. |
+| Q4_CR  | Experimental INT4 ConvRot | Maintainer recommendation for NVIDIA RTX 30-series systems. |

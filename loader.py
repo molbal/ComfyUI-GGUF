@@ -167,7 +167,6 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             key = field_name[len("comfy.gguf.quant."):]
             field = reader.get_field(field_name)
             custom_quant_configs[key] = json.loads(str(field.parts[field.data[-1]], "utf-8"))
-
     custom_quant_tensor_names = {
         tensor_name
         for key, quant_conf in custom_quant_configs.items()

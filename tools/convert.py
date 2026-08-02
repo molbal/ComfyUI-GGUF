@@ -9,6 +9,7 @@ import argparse
 import sys
 import tempfile
 from collections import OrderedDict
+from fnmatch import fnmatchcase
 from tqdm import tqdm
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -57,9 +58,15 @@ def key_matches(key, patterns):
     an unrelated, similarly-named submodule elsewhere in the tensor name
     (see ModelKrea2: bare "tmlp."/"tproj." also matched every per-block
     "txtmlp."/"txtproj." tensor, silently forcing far more of the model to
-    F32 than intended).
+    F32 than intended). Patterns containing '*' or '?' use shell-style
+    wildcards, which can express a path segment without matching nested
+    submodules.
     """
     for pattern in patterns:
+        if "*" in pattern or "?" in pattern:
+            if fnmatchcase(key, pattern[1:] if pattern.startswith("^") else pattern):
+                return True
+            continue
         if pattern.startswith("^"):
             if key.startswith(pattern[1:]):
                 return True
@@ -284,9 +291,28 @@ class ModelMinimaxH3(ModelTemplate):
             "final_layer.video_out.weight",
         )
     ]
-    # This is a model buffer used to interpolate timestep embeddings, rather
-    # than a Linear weight. Keep it in FP32 for the native interpolation path.
-    keys_hiprec = ["adaln_t_table"]
+    # The timestep table and final projections are used directly by the
+    # conditioning/output paths, rather than as ordinary transformer Linear
+    # weights. Keep them in FP32 for numerical stability.
+    keys_hiprec = [
+        "adaln_t_table",
+        "^video_patch_proj.",
+        "^audio_patch_proj.",
+        "^final_layer.",
+        "adaln_proj",
+        "modulation",
+        "^blocks.*.attn.qkv_proj.",
+        "^blocks.*.attn.out_proj.",
+        "^blocks.*.mlp.fc2.",
+    ]
+    # These paths are already BF16 in the reference checkpoint. Quantizing the
+    # conditioning projection or token refiner to W4A4 costs quality while
+    # saving little compared with the 50 main transformer blocks.
+    keys_noquant = [
+        "^condition_proj.",
+        "^token_refiner.",
+        "norm",
+    ]
 
 
 class ModelMinimaxH3VAE(ModelTemplate):
@@ -1068,7 +1094,11 @@ def handle_tensors(
             data_qtype = gguf.GGMLQuantizationType.F16
 
         # Q8_CR is the supported custom quantization path.
-        if data_qtype == gguf.GGMLQuantizationType.I8 and n_dims == 2 and quant_type_name == "Q8_CR":
+        if (
+            data_qtype == gguf.GGMLQuantizationType.I8
+            and n_dims == 2
+            and quant_type_name == "Q8_CR"
+        ):
             quantization_tensor = torch.from_numpy(data)
             if q8_cr_device is None:
                 q8_cr_device = resolve_quantization_device(quantization_device)

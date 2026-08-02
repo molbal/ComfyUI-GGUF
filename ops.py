@@ -6,6 +6,7 @@ import torch
 import logging
 import os
 import time
+from numbers import Real
 
 import comfy.ops
 import comfy.lora
@@ -14,6 +15,51 @@ from .dequant import dequantize_tensor, is_quantized
 
 
 _PERF_LOG_ENV = "COMFYUI_GGUF_PERF_LOG"
+_INT4_LORA_OFFLOAD_ENV = "COMFYUI_GGUF_INT4_LORA_OFFLOAD"
+
+
+def int4_lora_offload_enabled():
+    return os.environ.get(_INT4_LORA_OFFLOAD_ENV, "").strip().lower() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
+
+
+def log_cuda_oom_loaded_models(context):
+    """Log ComfyUI's managed model inventory before propagating a CUDA OOM."""
+    loaded_models = getattr(comfy.model_management, "current_loaded_models", ())
+    logging.error("ComfyUI-GGUF CUDA OOM while %s. Loaded models:", context)
+    if not loaded_models:
+        logging.error("  (none)")
+        return
+
+    for loaded_model in loaded_models:
+        patcher = getattr(loaded_model, "model", None)
+        model = getattr(patcher, "model", None)
+        model_class = type(model).__name__ if model is not None else "<unloaded>"
+        model_name = getattr(model, "name", None) or getattr(patcher, "model_name", None)
+        identifier = (
+            f"{model_class} ({model_name})"
+            if isinstance(model_name, str) and model_name
+            else model_class
+        )
+
+        size_bytes = None
+        model_memory = getattr(loaded_model, "model_memory", None)
+        if callable(model_memory):
+            try:
+                size_bytes = model_memory()
+            except (AttributeError, TypeError):
+                pass
+        if not isinstance(size_bytes, Real):
+            size_bytes = getattr(patcher, "size", None)
+
+        if isinstance(size_bytes, Real) and size_bytes >= 0:
+            logging.error("  %s: %.1f MiB", identifier, size_bytes / 1024**2)
+        else:
+            logging.error("  %s: size unavailable", identifier)
 
 
 def _configure_perf_logger():
@@ -538,15 +584,16 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 self._compute_dtype = torch.bfloat16
                 self._quantized_weight = None
                 self._quantized_weight_device = None
-                # Cache for a patched dequantized (LoRA/LoKR) weight. Re-quantizing
-                # small LoRA deltas to INT4 can round them away, so patched weights
-                # stay in the compute dtype while the pristine path remains INT4.
+                # Cache for a dequantized non-native patch. Re-quantizing a small
+                # delta to INT4 can round it away; compatible LoRA/LoKr instead use
+                # the packed base plus their low-rank output correction.
                 self._fused_weight = None
                 self._fused_patch_id = None
                 self._fused_weight_device = None
                 self._fused_bias = None
                 self._fused_bias_patch_id = None
                 self._fused_bias_device = None
+                self._lora_factor_cache = {}
 
             def install_patch_entries(self, patches, key):
                 """Expose a static patch as the same callable used by Dynamic VRAM."""
@@ -563,6 +610,7 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
 
             def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs):
+                self.evict_quantized_caches()
                 weight_key = f"{prefix}weight"
                 scale_key = f"{prefix}weight_scale"
                 quant_key = f"{prefix}comfy_quant"
@@ -631,6 +679,7 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 self._fused_bias_patch_id = None
                 self._fused_bias_device = None
                 self._fused_patch_keepalive = ()
+                self._lora_factor_cache.clear()
 
             def move_fused_caches(self, device):
                 """Move prepared patched caches without rebuilding them."""
@@ -741,12 +790,11 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 return bias
 
             def prepare_fused_weight(self, device):
-                """Fuse the active patch set before inference starts.
+                """Prepare fallback caches for active patch sets before inference.
 
-                The fused representation is kept on one device only. Moving a
-                prepared representation between CPU and CUDA is allowed, but a
-                patch/layout change evicts both the base and fused derived caches
-                before rebuilding them.
+                Compatible standard LoRA/LoKr patches keep the native INT4 base and
+                bypass with a low-rank output correction. Other patch forms use a
+                fused compute-dtype cache, kept on one device only.
                 """
                 if not self._quantized or self.weight is None:
                     return False
@@ -776,13 +824,23 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                     else:
                         self._quantized_weight = None
                         self._quantized_weight_device = None
-                        fused = self._get_cached_fused_weight(device) is not None
+                        try:
+                            fused = self._get_cached_fused_weight(device) is not None
+                        except torch.OutOfMemoryError:
+                            if torch.device(device).type != "cuda":
+                                raise
+                            self._move_derived_caches_to_cpu()
+                            logging.warning(
+                                "Q4_CR_W4A4 CUDA fallback for INT4 adapter layer: "
+                                "CUDA ran out of memory while preparing the patched weight."
+                            )
+                            fused = self._get_cached_fused_weight(torch.device("cpu")) is not None
                 if bias_functions:
                     self._get_cached_fused_bias(device, patch_id=patch_id)
                 return fused
 
             def _get_cached_fused_weight(self, device):
-                """Apply active adapters once and cache the full-precision result.
+                """Apply a non-native patch once and cache the compute-dtype result.
 
                 Re-quantizing a patched INT4 matrix can erase the small LoRA delta, so
                 patched layers use the dequantized compute-dtype matrix. The pristine
@@ -867,6 +925,34 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                         entries.append((strength, adapter))
                 return entries
 
+            def _get_cached_lora_factor(self, factor, device, dtype):
+                """Move a CPU adapter factor to CUDA, retaining it only with headroom."""
+                if not isinstance(factor, torch.Tensor):
+                    return factor
+                device = torch.device(device)
+                try:
+                    if factor.device.type != "cpu" or device.type != "cuda":
+                        return comfy.model_management.cast_to_device(factor, device, dtype)
+
+                    key = (id(factor), str(device), dtype)
+                    cached = self._lora_factor_cache.get(key)
+                    if cached is not None and cached[0] is factor:
+                        return cached[1]
+
+                    free_memory, _total_memory = torch.cuda.mem_get_info(device)
+                    cache_bytes = factor.numel() * torch.empty((), dtype=dtype).element_size()
+                    if (
+                        free_memory
+                        <= comfy.model_management.extra_reserved_memory() + cache_bytes
+                    ):
+                        return comfy.model_management.cast_to_device(factor, device, dtype)
+                    cached_factor = comfy.model_management.cast_to_device(factor, device, dtype)
+                except torch.OutOfMemoryError:
+                    log_cuda_oom_loaded_models("caching INT4 LoRA/LoKr factors")
+                    raise
+                self._lora_factor_cache[key] = (factor, cached_factor)
+                return cached_factor
+
             def _native_lora_bypass(self, input, base_out):
                 entries = self._native_lora_patch_entries()
                 if not entries:
@@ -877,8 +963,8 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                         up, down, alpha, mid, dora_scale, reshape = adapter.weights
                         if mid is not None or dora_scale is not None or reshape is not None:
                             return None
-                        up = comfy.model_management.cast_to_device(up, input.device, input.dtype)
-                        down = comfy.model_management.cast_to_device(down, input.device, input.dtype)
+                        up = self._get_cached_lora_factor(up, input.device, input.dtype)
+                        down = self._get_cached_lora_factor(down, input.device, input.dtype)
                         rank = down.shape[0]
                         scale = (alpha / rank) if alpha is not None else 1.0
                         delta = torch.nn.functional.linear(
@@ -892,15 +978,54 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                         # persistent CPU/offload adapter.
                         local_adapter = copy.copy(adapter)
                         local_adapter.weights = tuple(
-                            comfy.model_management.cast_to_device(
+                            self._get_cached_lora_factor(
                                 weight, input.device, input.dtype
                             )
                             if isinstance(weight, torch.Tensor) else weight
                             for weight in getattr(adapter, "weights", ())
                         )
                         delta = local_adapter.h(input, base_out)
-                    out = out + strength * delta
+                    # Avoid materializing a scaled copy of delta and a second output
+                    # tensor. This matters for large Flux activations where the
+                    # residual can be hundreds of MiB even though the base is INT4.
+                    out.add_(delta, alpha=strength)
                 return out
+
+            def _move_derived_caches_to_cpu(self):
+                """Release CUDA derived caches before a system-memory retry."""
+                self._quantized_weight = None
+                self._quantized_weight_device = None
+                self.move_fused_caches(torch.device("cpu"))
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            def _cpu_forward_fallback(self, input, bias, native_entries=None, use_fused_weight=False):
+                """Run one failed INT4 layer through CPU system memory."""
+                original_device = input.device
+                cpu = torch.device("cpu")
+                if original_device.type == "cuda":
+                    self._move_derived_caches_to_cpu()
+                cpu_input = input.to(device=cpu)
+                cpu_bias = bias.to(device=cpu, dtype=cpu_input.dtype) if bias is not None else None
+
+                if native_entries:
+                    cpu_weight = self._dequantized_weight(cpu, cpu_input.dtype)
+                    cpu_out = torch.nn.functional.linear(cpu_input, cpu_weight)
+                    if cpu_bias is not None:
+                        cpu_out = cpu_out + cpu_bias
+                    cpu_out = self._native_lora_bypass(cpu_input, cpu_out)
+                elif use_fused_weight:
+                    cpu_weight = self._get_cached_fused_weight(cpu)
+                    cpu_out = torch.nn.functional.linear(
+                        cpu_input,
+                        cpu_weight.to(device=cpu, dtype=cpu_input.dtype),
+                        cpu_bias,
+                    )
+                else:
+                    cpu_weight = self._dequantized_weight(cpu, cpu_input.dtype)
+                    cpu_out = torch.nn.functional.linear(cpu_input, cpu_weight, cpu_bias)
+
+                return cpu_out.to(device=original_device, dtype=input.dtype)
 
             def forward_comfy_cast_weights(self, input, *args, **kwargs):
                 has_weight_functions = bool(getattr(self, "weight_function", ()))
@@ -925,40 +1050,106 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                     weight = self.weight.to(device=input.device, dtype=input.dtype)
                     return torch.nn.functional.linear(input, weight, bias)
                 if has_weight_functions or has_bias_functions:
-                    # A real LoRA/LoKR/adapter patch is present. Dynamic VRAM promotes a
-                    # LowVramPatch into weight_function, and the adapter's factors are
-                    # floats, so they must be applied to the full-precision weight. We
-                    # cache the patched (un-rotated) BF16 weight rather than re-quantizing
-                    # it: small LoRA deltas can otherwise disappear in INT4 rounding.
+                    # Compatible LoRA/LoKr uses the native base plus a low-rank output
+                    # correction. Other patch forms use a cached un-rotated BF16
+                    # fallback rather than re-quantizing a delta that INT4 could erase.
                     # Bias-only patches retain the native INT4 weight path.
                     if has_weight_functions:
-                        weight_qt = self._get_cached_quantized_weight(input.device)
+                        native_entries = self._native_lora_patch_entries()
+                        if (
+                            native_entries is None
+                            and self._fused_weight is not None
+                            and self._fused_weight.device.type == "cpu"
+                            and input.device.type == "cuda"
+                        ):
+                            return self._cpu_forward_fallback(
+                                input, bias, use_fused_weight=True
+                            )
+                        try:
+                            weight_qt = self._get_cached_quantized_weight(input.device)
+                        except torch.OutOfMemoryError:
+                            if input.device.type != "cuda":
+                                raise
+                            logging.warning(
+                                "Q4_CR_W4A4 CUDA fallback for INT4 adapter layer: "
+                                "CUDA ran out of memory; retrying this layer in system memory."
+                            )
+                            return self._cpu_forward_fallback(
+                                input,
+                                bias,
+                                native_entries=native_entries,
+                                use_fused_weight=not bool(native_entries),
+                            )
                         if weight_qt is not None:
-                            base_out = torch.nn.functional.linear(input, weight_qt)
+                            base_out = None
+                            try:
+                                base_out = torch.nn.functional.linear(input, weight_qt)
+                                if bias is not None:
+                                    base_out = base_out + bias
+                                bypass_out = self._native_lora_bypass(input, base_out)
+                                if bypass_out is not None:
+                                    return bypass_out
+                            except torch.OutOfMemoryError:
+                                if input.device.type != "cuda":
+                                    raise
+                                del base_out
+                                del weight_qt
+                                logging.warning(
+                                    "Q4_CR_W4A4 CUDA fallback for INT4 adapter layer: "
+                                    "CUDA ran out of memory; retrying this layer in system memory."
+                                )
+                                return self._cpu_forward_fallback(
+                                    input, bias, native_entries=native_entries
+                                )
+                        try:
+                            fused_weight = self._get_cached_fused_weight(input.device)
+                        except torch.OutOfMemoryError:
+                            if input.device.type != "cuda":
+                                raise
+                            logging.warning(
+                                "Q4_CR_W4A4 CUDA fallback for INT4 adapter layer: "
+                                "CUDA ran out of memory; retrying this layer in system memory."
+                            )
+                            return self._cpu_forward_fallback(input, bias, use_fused_weight=True)
+                        if fused_weight.device.type == "cpu" and input.device.type == "cuda":
+                            return self._cpu_forward_fallback(input, bias, use_fused_weight=True)
+                        try:
+                            out = torch.nn.functional.linear(
+                                input,
+                                fused_weight.to(device=input.device, dtype=input.dtype),
+                            )
                             if bias is not None:
-                                base_out = base_out + bias
-                            bypass_out = self._native_lora_bypass(input, base_out)
-                            if bypass_out is not None:
-                                return bypass_out
-                        fused_weight = self._get_cached_fused_weight(input.device)
-                        out = torch.nn.functional.linear(
-                            input,
-                            fused_weight.to(device=input.device, dtype=input.dtype),
-                        )
-                        if bias is not None:
-                            out = out + bias
-                        return out
+                                out = out + bias
+                            return out
+                        except torch.OutOfMemoryError:
+                            if input.device.type != "cuda":
+                                raise
+                            del fused_weight
+                            logging.warning(
+                                "Q4_CR_W4A4 CUDA fallback for INT4 adapter layer: "
+                                "CUDA ran out of memory; retrying this layer in system memory."
+                            )
+                            return self._cpu_forward_fallback(input, bias, use_fused_weight=True)
 
-                weight_qt = self._get_cached_quantized_weight(input.device)
-                if weight_qt is None:
-                    # No comfy_kitchen / non-CUDA: dequant fallback.
-                    _orig_w = self._dequantized_weight(input.device, input.dtype)
-                    return torch.nn.functional.linear(input, _orig_w, bias)
+                try:
+                    weight_qt = self._get_cached_quantized_weight(input.device)
+                    if weight_qt is None:
+                        # No comfy_kitchen / non-CUDA: dequant fallback.
+                        _orig_w = self._dequantized_weight(input.device, input.dtype)
+                        return torch.nn.functional.linear(input, _orig_w, bias)
 
-                out = torch.nn.functional.linear(input, weight_qt)
-                if bias is not None:
-                    out = out + bias
-                return out
+                    out = torch.nn.functional.linear(input, weight_qt)
+                    if bias is not None:
+                        out = out + bias
+                    return out
+                except torch.OutOfMemoryError:
+                    if input.device.type != "cuda":
+                        raise
+                    logging.warning(
+                        "Q4_CR_W4A4 CUDA fallback for INT4 layer: "
+                        "CUDA ran out of memory; retrying this layer in system memory."
+                    )
+                    return self._cpu_forward_fallback(input, bias)
 
             def forward(self, *args, **kwargs):
                 input_tensor = args[0] if args else kwargs.get("input")

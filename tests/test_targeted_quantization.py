@@ -2,6 +2,7 @@ import unittest
 import json
 import gc
 import os
+from contextlib import nullcontext
 from collections import OrderedDict
 import importlib.util
 from pathlib import Path
@@ -1575,6 +1576,108 @@ class MinimaxH3DetectionTests(unittest.TestCase):
 
         self.assertIn("adaln_t_table", model_arch.keys_hiprec)
 
+    def test_q4_preserves_sensitive_transformer_components(self):
+        state_dict = {
+            "blocks.0.attn.qkv_proj.weight": torch.ones((512, 512), dtype=torch.float16),
+            "blocks.0.adaln_proj.linear.weight": torch.ones((512, 8), dtype=torch.float16),
+            "blocks.0.attn.norm1.weight": torch.ones((512,), dtype=torch.bfloat16),
+            "blocks.0.mlp.norm.weight": torch.ones((512,), dtype=torch.bfloat16),
+            "blocks.0.modulation.weight": torch.ones((512, 512), dtype=torch.float16),
+            "condition_proj.weight": torch.ones((512, 512), dtype=torch.bfloat16),
+            "final_layer.video_out.weight": torch.ones((96, 512), dtype=torch.float32),
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "minimax_h3.safetensors"
+            output_path = Path(temp_dir) / "minimax_h3-Q4_CR_W4A4.gguf"
+            save_file(state_dict, str(source_path))
+
+            converted_path, _ = convert_file(
+                str(source_path),
+                str(output_path),
+                interact=False,
+                quant_type_name="Q4_CR_W4A4",
+                quantization_device="cpu",
+            )
+
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+
+        self.assertEqual(
+            tensor_types["blocks.0.attn.qkv_proj.weight"],
+            gguf.GGMLQuantizationType.F32,
+        )
+        self.assertEqual(
+            tensor_types["blocks.0.adaln_proj.linear.weight"],
+            gguf.GGMLQuantizationType.F32,
+        )
+        self.assertEqual(
+            tensor_types["blocks.0.attn.norm1.weight"],
+            gguf.GGMLQuantizationType.BF16,
+        )
+        self.assertEqual(
+            tensor_types["blocks.0.modulation.weight"],
+            gguf.GGMLQuantizationType.F32,
+        )
+        self.assertEqual(
+            tensor_types["condition_proj.weight"],
+            gguf.GGMLQuantizationType.BF16,
+        )
+
+    def test_q4_preserves_conditioning_refiner_and_output_paths(self):
+        state_dict = {
+            "video_patch_proj.weight": torch.ones((512, 96), dtype=torch.float32),
+            "audio_patch_proj.weight": torch.ones((512, 32), dtype=torch.float32),
+            "blocks.0.attn.qkv_proj.weight": torch.ones((512, 512), dtype=torch.float16),
+            "condition_proj.weight": torch.ones((512, 512), dtype=torch.bfloat16),
+            "token_refiner.blocks.0.attn.qkv_proj.weight": torch.ones(
+                (512, 512), dtype=torch.bfloat16
+            ),
+            "final_layer.video_out.weight": torch.ones((96, 512), dtype=torch.float32),
+            "adaln_t_table": torch.ones((32, 8), dtype=torch.float32),
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "minimax_h3.safetensors"
+            output_path = Path(temp_dir) / "minimax_h3-Q4_CR_W4A4.gguf"
+            save_file(state_dict, str(source_path))
+
+            converted_path, _ = convert_file(
+                str(source_path),
+                str(output_path),
+                interact=False,
+                quant_type_name="Q4_CR_W4A4",
+                quantization_device="cpu",
+            )
+
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+
+        self.assertEqual(
+            tensor_types["blocks.0.attn.qkv_proj.weight"],
+            gguf.GGMLQuantizationType.F32,
+        )
+        self.assertEqual(
+            tensor_types["condition_proj.weight"],
+            gguf.GGMLQuantizationType.BF16,
+        )
+        self.assertEqual(
+            tensor_types["token_refiner.blocks.0.attn.qkv_proj.weight"],
+            gguf.GGMLQuantizationType.BF16,
+        )
+        self.assertEqual(
+            tensor_types["final_layer.video_out.weight"],
+            gguf.GGMLQuantizationType.F32,
+        )
+
     def test_converts_to_minimax_h3_gguf_with_full_precision_adaln_table(self):
         state_dict = {
             "video_patch_proj.weight": torch.ones((32, 32), dtype=torch.float16),
@@ -1682,7 +1785,7 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         state_dict = {
             "video_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
             "audio_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
-            "blocks.0.attn.qkv_proj.weight": torch.ones((96, 512), dtype=torch.float32),
+            "blocks.0.mlp.fc1.weight": torch.ones((128, 512), dtype=torch.float32),
             "final_layer.video_out.weight": torch.ones((96, 512), dtype=torch.float32),
         }
 
@@ -1708,15 +1811,15 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
             del reader
 
         # Weight stays I8 (2 uint4 per byte) and per-row scale stored as F16.
-        self.assertEqual(tensor_types["blocks.0.attn.qkv_proj.weight"], gguf.GGMLQuantizationType.I8)
-        self.assertEqual(tensor_types["blocks.0.attn.qkv_proj.weight_scale"], gguf.GGMLQuantizationType.F16)
-        self.assertIn("blocks.0.attn.qkv_proj.weight_scale", names)
+        self.assertEqual(tensor_types["blocks.0.mlp.fc1.weight"], gguf.GGMLQuantizationType.I8)
+        self.assertEqual(tensor_types["blocks.0.mlp.fc1.weight_scale"], gguf.GGMLQuantizationType.F16)
+        self.assertIn("blocks.0.mlp.fc1.weight_scale", names)
 
     def test_int4_cr_w4a4_loader_routes_to_w4a4_ops(self):
         state_dict = {
             "video_patch_proj.weight": torch.randn(32, 32, dtype=torch.float32),
             "audio_patch_proj.weight": torch.randn(32, 32, dtype=torch.float32),
-            "blocks.0.attn.qkv_proj.weight": torch.randn(96, 512, dtype=torch.float32),
+            "blocks.0.mlp.fc1.weight": torch.randn(128, 512, dtype=torch.float32),
             "final_layer.video_out.weight": torch.randn(96, 512, dtype=torch.float32),
         }
 
@@ -1736,8 +1839,8 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
             loader = load_gguf_loader()
             sd, extra = loader.gguf_sd_loader(converted_path)
 
-            w = sd["blocks.0.attn.qkv_proj.weight"]
-            sd_key = "blocks.0.attn.qkv_proj"
+            w = sd["blocks.0.mlp.fc1.weight"]
+            sd_key = "blocks.0.mlp.fc1"
             qraw = sd[f"{sd_key}.comfy_quant"]
             quant_conf = json.loads(bytes(qraw.tolist()).decode("utf-8"))
 
@@ -1750,7 +1853,59 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
 
         self.assertEqual(quant_conf["format"], "int4_cr")
         self.assertEqual(quant_conf["backing"], "w4a4")
-        self.assertEqual(quant_conf["orig_shape"], [96, 512])
+        self.assertEqual(quant_conf["orig_shape"], [128, 512])
+
+    def test_minimax_h3_q4_keeps_residual_projections_in_full_precision(self):
+        state_dict = {
+            "video_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
+            "audio_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
+            "blocks.0.attn.qkv_proj.weight": torch.ones((96, 512), dtype=torch.float32),
+            "blocks.0.attn.out_proj.weight": torch.ones((96, 512), dtype=torch.float32),
+            "blocks.0.mlp.fc1.weight": torch.ones((128, 512), dtype=torch.float32),
+            "blocks.0.mlp.fc2.weight": torch.ones((96, 512), dtype=torch.float32),
+            "final_layer.video_out.weight": torch.ones((96, 32), dtype=torch.float32),
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "minimax_h3.safetensors"
+            output_path = Path(temp_dir) / "minimax_h3-Q4_CR_W4A4.gguf"
+            save_file(state_dict, str(source_path))
+
+            converted_path, _ = convert_file(
+                str(source_path),
+                str(output_path),
+                interact=False,
+                quant_type_name="Q4_CR_W4A4",
+                quantization_device="cpu",
+            )
+
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            quant_config_names = {
+                field_name[len("comfy.gguf.quant."):]
+                for field_name in reader.fields
+                if field_name.startswith("comfy.gguf.quant.")
+            }
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+
+        self.assertEqual(
+            tensor_types["blocks.0.attn.qkv_proj.weight"],
+            gguf.GGMLQuantizationType.F32,
+        )
+        self.assertEqual(
+            tensor_types["blocks.0.attn.out_proj.weight"],
+            gguf.GGMLQuantizationType.F32,
+        )
+        self.assertEqual(
+            tensor_types["blocks.0.mlp.fc2.weight"],
+            gguf.GGMLQuantizationType.F32,
+        )
+        self.assertNotIn("blocks.0.attn.qkv_proj.weight", quant_config_names)
+        self.assertNotIn("blocks.0.attn.out_proj.weight", quant_config_names)
+        self.assertNotIn("blocks.0.mlp.fc2.weight", quant_config_names)
 
     def test_int4_cr_w4a4_ops_empty_patch_keeps_native_kernel(self):
         # With no weight_function (the normal DynamicVRAM case when no LoRA is active),
@@ -1904,13 +2059,10 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         self.assertIsNone(lin._fused_weight)
         self.assertIsNone(lin._fused_bias)
 
-    def test_int4_cr_w4a4_ops_lora_patch_is_applied(self):
-        # A real LoRA patch must be applied to the dequantized (full-precision,
-        # un-rotated) weight (so its delta is not silently dropped) and then the fused
-        # weight is re-quantized back into the ConvRot int4 layout so the fast
-        # tensor-core kernel stays active. Before the fix the weight_function was only
-        # probed against the packed int8 and then discarded, so LoRAs produced the
-        # un-patched output (or fell back to a full-precision matmul every forward).
+    def test_int4_cr_w4a4_ops_non_native_patch_is_applied(self):
+        # A non-native patch must be applied to the dequantized, un-rotated weight
+        # and retained in the fallback cache. Standard LoRA uses the native low-rank
+        # bypass exercised by the following test instead.
         ops = ops_factory()
         lin = ops.Linear(64, 64, bias=True)
         weight = torch.randn(64, 512, dtype=torch.float32)
@@ -2033,6 +2185,81 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         self.assertIsNone(lin._fused_weight)
         self.assertIsNotNone(lin._quantized_weight)
 
+    def test_int4_cr_w4a4_ops_cpu_fallback_applies_native_lora(self):
+        from comfy.weight_adapter import LoRAAdapter
+
+        ops = ops_factory()
+        lin = ops.Linear(64, 64, bias=True)
+        weight = torch.randn(64, 512, dtype=torch.float32)
+        packed, wscales, quant_conf, orig_shape = quantize_int4_cr_w4a4(
+            weight, convrot_groupsize=256, quant_group_size=64, device=torch.device("cpu")
+        )
+        quant_conf["orig_shape"] = [64, 512]
+        lin._load_from_state_dict(
+            {
+                "weight": packed,
+                "weight_scale": wscales.half(),
+                "comfy_quant": torch.tensor(list(json.dumps(quant_conf).encode("utf-8"))),
+                "bias": torch.randn(64, dtype=torch.float32),
+            },
+            prefix="",
+            local_metadata={},
+            strict=True,
+            missing_keys=[],
+            unexpected_keys=[],
+            error_msgs=[],
+        )
+
+        rank = 8
+        up = torch.randn(64, rank, dtype=torch.float32)
+        down = torch.randn(rank, 512, dtype=torch.float32)
+        adapter = LoRAAdapter(set(), (up, down, 4.0, None, None, None))
+        key = "blocks.1.weight"
+        patches = {key: [(0.75, adapter, 1.0, None, None)]}
+
+        class FakeLowVramPatch:
+            is_lowvram_patch = True
+
+            def __init__(self, key, patches):
+                self.key = key
+                self.patches = patches
+                self.prepared_patches = None
+
+            def __call__(self, value):
+                return value
+
+        x = torch.randn(8, 512, dtype=torch.float32)
+        lin.weight_function = [FakeLowVramPatch(key, patches)]
+        native_entries = lin._native_lora_patch_entries()
+
+        fallback = lin._cpu_forward_fallback(x, lin.bias, native_entries=native_entries)
+        expected = torch.nn.functional.linear(
+            x, lin._dequantized_weight(torch.device("cpu"), x.dtype), lin.bias
+        ) + 0.75 * torch.nn.functional.linear(
+            torch.nn.functional.linear(x, down), up
+        ) * (4.0 / rank)
+        torch.testing.assert_close(fallback, expected, atol=1e-4, rtol=1e-3)
+        self.assertEqual(fallback.device, torch.device("cpu"))
+
+    def test_int4_cr_w4a4_ops_dispatches_to_cpu_on_cuda_oom(self):
+        ops = ops_factory()
+        lin = ops.Linear(4, 4, bias=False)
+        lin.weight = torch.zeros((4, 4), dtype=torch.float32)
+        lin._quantized = True
+        lin.weight_function = [lambda value: value]
+        input_tensor = mock.Mock(device=torch.device("cuda"), dtype=torch.float16)
+        sentinel = object()
+
+        with mock.patch.object(
+            lin, "_get_cached_quantized_weight", side_effect=torch.OutOfMemoryError("test")
+        ), mock.patch.object(lin, "_cpu_forward_fallback", return_value=sentinel) as fallback:
+            result = lin.forward_comfy_cast_weights(input_tensor)
+
+        self.assertIs(result, sentinel)
+        fallback.assert_called_once_with(
+            input_tensor, None, native_entries=None, use_fused_weight=True
+        )
+
     def test_int4_cr_w4a4_ops_lokr_uses_native_base_and_residual(self):
         from comfy.weight_adapter.lokr import LoKrAdapter
 
@@ -2098,6 +2325,97 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         self.assertEqual(w2.device, torch.device("cpu"))
         self.assertIsNone(lin._fused_weight)
         self.assertIsNotNone(lin._quantized_weight)
+
+    def test_int4_lora_factor_cache_reuses_cuda_factors_with_headroom(self):
+        ops = ops_factory()
+        lin = ops.Linear(64, 64, bias=False)
+        factors = [torch.randn(8, 64), torch.randn(64, 8), torch.randn(4, 4)]
+        cuda = torch.device("cuda:0")
+        reserve = 1024**3
+
+        with mock.patch.object(
+            torch.cuda, "mem_get_info", return_value=(2 * reserve, 8 * reserve)
+        ), mock.patch.object(
+            comfy.model_management, "extra_reserved_memory", return_value=reserve
+        ), mock.patch.object(
+            comfy.model_management,
+            "cast_to_device",
+            side_effect=lambda factor, device, dtype: factor,
+        ) as cast:
+            for factor in factors:
+                self.assertIs(
+                    lin._get_cached_lora_factor(factor, cuda, torch.bfloat16), factor
+                )
+                self.assertIs(
+                    lin._get_cached_lora_factor(factor, cuda, torch.bfloat16), factor
+                )
+
+        self.assertEqual(cast.call_count, len(factors))
+        self.assertEqual(len(lin._lora_factor_cache), len(factors))
+        lin.evict_quantized_caches()
+        self.assertFalse(lin._lora_factor_cache)
+
+    def test_int4_lora_factor_cache_streams_at_cuda_reserve_boundary(self):
+        ops = ops_factory()
+        lin = ops.Linear(64, 64, bias=False)
+        factor = torch.randn(8, 64)
+        cuda = torch.device("cuda:0")
+        reserve = 1024**3
+
+        with mock.patch.object(
+            torch.cuda, "mem_get_info", return_value=(reserve, 8 * reserve)
+        ), mock.patch.object(
+            comfy.model_management, "extra_reserved_memory", return_value=reserve
+        ), mock.patch.object(
+            comfy.model_management,
+            "cast_to_device",
+            side_effect=lambda factor, device, dtype: factor,
+        ) as cast:
+            lin._get_cached_lora_factor(factor, cuda, torch.bfloat16)
+            lin._get_cached_lora_factor(factor, cuda, torch.bfloat16)
+
+        self.assertEqual(cast.call_count, 2)
+        self.assertFalse(lin._lora_factor_cache)
+
+    def test_int4_lora_factor_cache_logs_loaded_models_and_reraises_cuda_oom(self):
+        ops = ops_factory()
+        lin = ops.Linear(64, 64, bias=False)
+        factor = torch.randn(8, 64)
+        cuda = torch.device("cuda:0")
+        loaded_model = type(
+            "FakeLoadedModel",
+            (),
+            {
+                "model": type(
+                    "FakePatcher",
+                    (),
+                    {"model": type("CachedModel", (), {"name": "base"})(), "size": 2 * 1024**2},
+                )()
+            },
+        )()
+        missing_size_model = type(
+            "FakeLoadedModel",
+            (),
+            {"model": type("FakePatcher", (), {"model": type("AdapterModel", (), {})()})()},
+        )()
+
+        with mock.patch.object(
+            torch.cuda, "mem_get_info", return_value=(2 * 1024**3, 8 * 1024**3)
+        ), mock.patch.object(
+            comfy.model_management,
+            "current_loaded_models",
+            [loaded_model, missing_size_model],
+        ), mock.patch.object(
+            comfy.model_management,
+            "cast_to_device",
+            side_effect=torch.OutOfMemoryError("forced cache OOM"),
+        ), self.assertLogs(level="ERROR") as logs:
+            with self.assertRaisesRegex(torch.OutOfMemoryError, "forced cache OOM"):
+                lin._get_cached_lora_factor(factor, cuda, torch.bfloat16)
+
+        self.assertIn("caching INT4 LoRA/LoKr factors", logs.output[0])
+        self.assertIn("CachedModel (base): 2.0 MiB", logs.output[1])
+        self.assertIn("AdapterModel: size unavailable", logs.output[2])
 
     def test_int4_cr_w4a4_ops_fused_cache_survives_lowvram_patch_rebind(self):
         # Dynamic VRAM (GGUFModelPatcherDynamic.load) promotes a freshly created
@@ -2178,19 +2496,6 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         calls = []
         moves = []
 
-        class Progress:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def set_postfix_str(self, *args, **kwargs):
-                pass
-
-            def update(self, *args, **kwargs):
-                pass
-
         modules = [
             type(
                 "FakeQuantizedLayer",
@@ -2215,14 +2520,439 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
             },
         )()
 
-        with mock.patch.object(nodes_module, "tqdm", return_value=Progress()), \
-                mock.patch.object(nodes_module.comfy.model_management, "cuda_device_context", return_value=Progress()), \
+        with mock.patch.object(nodes_module.comfy.model_management, "cuda_device_context", return_value=nullcontext()), \
                 mock.patch.object(nodes_module.comfy.model_management, "throw_exception_if_processing_interrupted", None):
             prepared = nodes_module.GGUFModelPatcher._prepare_gguf_quantized_weights(patcher)
 
+        self.assertFalse(hasattr(nodes_module, "tqdm"))
         self.assertEqual(prepared, 1)
         self.assertEqual(calls, [torch.device("cuda:0")])
         self.assertEqual(moves, [torch.device("cpu")])
+
+    def test_int4_patch_preparation_evicts_caches_after_interrupt(self):
+        nodes_module = nodes_factory()
+        calls = []
+        evictions = []
+        modules = [
+            type(
+                "FakeQuantizedLayer",
+                (),
+                {
+                    "weight_function": [object()],
+                    "bias_function": [],
+                    "_fused_patch_signature": lambda self: ("patch",),
+                    "prepare_fused_weight": lambda self, device: calls.append(device) or True,
+                },
+            )(),
+            type(
+                "FakeQuantizedLayer",
+                (),
+                {
+                    "weight_function": [object()],
+                    "bias_function": [],
+                    "_fused_patch_signature": lambda self: ("patch",),
+                    "prepare_fused_weight": lambda self, device: calls.append(device) or True,
+                },
+            )(),
+        ]
+        patcher = type(
+            "FakePatcher",
+            (),
+            {
+                "model": type(
+                    "FakeModel",
+                    (),
+                    {
+                        "named_modules": lambda self: [
+                            ("first", modules[0]),
+                            ("second", modules[1]),
+                        ]
+                    },
+                )(),
+                "load_device": torch.device("cpu"),
+                "offload_device": torch.device("cpu"),
+                "_gguf_patch_layout_signature": None,
+                "_evict_gguf_quantized_caches": lambda self: evictions.append(True),
+            },
+        )()
+        with mock.patch.object(
+            nodes_module.comfy.model_management,
+            "throw_exception_if_processing_interrupted",
+            side_effect=RuntimeError("interrupted"),
+        ), mock.patch.object(
+            nodes_module.comfy.model_management,
+            "cuda_device_context",
+            return_value=nullcontext(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                nodes_module.GGUFModelPatcher._prepare_gguf_quantized_weights(patcher)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(evictions, [True])
+
+    def test_dynamic_vram_warns_for_unique_offloaded_lora_factors(self):
+        nodes_module = nodes_factory()
+        factor = torch.ones((2, 2))
+        adapter = type(
+            "FakeLoRAAdapter",
+            (),
+            {"name": "lora", "weights": (factor, factor, 1.0, None, None, None)},
+        )()
+        key = "blocks.1.weight"
+        patch_function = type(
+            "FakeLowVramPatch",
+            (),
+            {
+                "is_lowvram_patch": True,
+                "key": key,
+                "patches": {key: [(1.0, adapter, 1.0, None, None)]},
+                "prepared_patches": None,
+            },
+        )()
+        module = type(
+            "FakeLayer",
+            (),
+            {"weight_function": [patch_function], "bias_function": []},
+        )()
+        patcher = type(
+            "FakeDynamicPatcher",
+            (),
+            {
+                "model": type(
+                    "FakeModel",
+                    (),
+                    {"named_modules": lambda self: [("layer", module)]},
+                )(),
+                "load_device": torch.device("cuda:0"),
+                "offload_device": torch.device("cpu"),
+            },
+        )()
+
+        with mock.patch.dict(
+            os.environ, {"COMFYUI_GGUF_INT4_LORA_OFFLOAD": "yes"}
+        ), mock.patch.object(
+            nodes_module, "_DYNAMIC_VRAM_LORA_WARNING_MIN_BYTES", 1
+        ), mock.patch.object(torch.cuda, "is_available", return_value=True), mock.patch.object(
+            torch.cuda, "mem_get_info", return_value=(2 * 1024**3, 8 * 1024**3)
+        ), self.assertLogs(level="WARNING") as logs:
+            warned = nodes_module.GGUFModelPatcherDynamic._warn_dynamic_vram_lora_streaming(
+                patcher
+            )
+
+        self.assertTrue(warned)
+        self.assertIn("1 unique offloaded LoRA/LoKr factor tensors", logs.output[0])
+        self.assertIn("from cpu to cuda:0", logs.output[0])
+        self.assertIn("CUDA free/total 2.0/8.0 GiB", logs.output[0])
+        self.assertIn("does not guarantee an OOM", logs.output[0])
+
+    def test_dynamic_vram_preloads_unique_lora_and_lokr_factors(self):
+        nodes_module = nodes_factory()
+        shared = torch.ones((2, 2))
+        lora_only = torch.ones((2, 3))
+        lokr_only = torch.ones((3, 2))
+        lora = type(
+            "FakeLoRAAdapter",
+            (),
+            {"name": "lora", "weights": (shared, lora_only, 4.0, None, "preserve")},
+        )()
+        lokr = type(
+            "FakeLoKrAdapter",
+            (),
+            {"name": "lokr", "weights": (lokr_only, shared, None, 2.0)},
+        )()
+        key = "blocks.1.weight"
+        patch_function = type(
+            "FakeLowVramPatch",
+            (),
+            {
+                "is_lowvram_patch": True,
+                "key": key,
+                "patches": {
+                    key: [
+                        (1.0, lora, 1.0, None, None),
+                        (1.0, lokr, 1.0, None, None),
+                    ]
+                },
+                "prepared_patches": None,
+            },
+        )()
+        module = type(
+            "FakeLayer",
+            (),
+            {"weight_function": [patch_function], "bias_function": []},
+        )()
+        replacements = {}
+        moved = []
+
+        def move_factor(factor, device):
+            moved.append((factor, device))
+            replacement = factor.clone()
+            replacements[id(factor)] = replacement
+            return replacement
+
+        patcher = type(
+            "FakeDynamicPatcher",
+            (),
+            {
+                "model": type(
+                    "FakeModel",
+                    (),
+                    {"named_modules": lambda self: [("layer", module)]},
+                )(),
+                "load_device": torch.device("cuda:0"),
+                "offload_device": torch.device("cpu"),
+                "_move_dynamic_vram_lora_factor": staticmethod(move_factor),
+            },
+        )()
+        factor_bytes = sum(
+            factor.numel() * factor.element_size()
+            for factor in (shared, lora_only, lokr_only)
+        )
+        reserve = 123456
+
+        with mock.patch.object(torch.cuda, "is_available", return_value=True), mock.patch.object(
+            torch.cuda, "mem_get_info", return_value=(reserve + factor_bytes, 8 * reserve)
+        ), mock.patch.object(
+            nodes_module.comfy.model_management, "extra_reserved_memory", return_value=reserve
+        ):
+            preloaded = nodes_module.GGUFModelPatcherDynamic._preload_dynamic_vram_lora_factors(
+                patcher
+            )
+
+        self.assertTrue(preloaded)
+        self.assertEqual(len(moved), 3)
+        self.assertEqual(
+            {id(factor) for factor, _ in moved},
+            {id(shared), id(lora_only), id(lokr_only)},
+        )
+        self.assertTrue(all(device == torch.device("cuda:0") for _, device in moved))
+        self.assertIs(lora.weights[0], replacements[id(shared)])
+        self.assertIs(lora.weights[1], replacements[id(lora_only)])
+        self.assertIs(lokr.weights[0], replacements[id(lokr_only)])
+        self.assertIs(lokr.weights[1], replacements[id(shared)])
+        self.assertEqual(lora.weights[2:], (4.0, None, "preserve"))
+        self.assertEqual(lokr.weights[2:], (None, 2.0))
+
+    def test_dynamic_vram_keeps_lora_factors_on_cuda_without_offload_enabled(self):
+        nodes_module = nodes_factory()
+        lora_factor = torch.ones((2, 2))
+        lokr_factor = torch.ones((2, 3))
+        lora = type(
+            "FakeLoRAAdapter", (), {"name": "lora", "weights": (lora_factor, 4.0)}
+        )()
+        lokr = type(
+            "FakeLoKrAdapter", (), {"name": "lokr", "weights": (lokr_factor, None)}
+        )()
+        original_lora_weights = lora.weights
+        original_lokr_weights = lokr.weights
+        key = "blocks.1.weight"
+        patch_function = type(
+            "FakeLowVramPatch",
+            (),
+            {
+                "is_lowvram_patch": True,
+                "key": key,
+                "patches": {
+                    key: [
+                        (1.0, lora, 1.0, None, None),
+                        (1.0, lokr, 1.0, None, None),
+                    ]
+                },
+                "prepared_patches": None,
+            },
+        )()
+        module = type(
+            "FakeLayer",
+            (),
+            {"weight_function": [patch_function], "bias_function": []},
+        )()
+        moved = []
+        patcher = type(
+            "FakeDynamicPatcher",
+            (),
+            {
+                "model": type(
+                    "FakeModel",
+                    (),
+                    {"named_modules": lambda self: [("layer", module)]},
+                )(),
+                "load_device": torch.device("cuda:0"),
+                "offload_device": torch.device("cpu"),
+                "_move_dynamic_vram_lora_factor": staticmethod(
+                    lambda factor, device: moved.append((factor, device)) or factor.clone()
+                ),
+            },
+        )()
+        factor_bytes = (
+            lora_factor.numel() * lora_factor.element_size()
+            + lokr_factor.numel() * lokr_factor.element_size()
+        )
+        reserve = 123456
+
+        with mock.patch.dict(
+            os.environ, {"COMFYUI_GGUF_INT4_LORA_OFFLOAD": "false"}
+        ), mock.patch.object(torch.cuda, "is_available", return_value=True), mock.patch.object(
+            torch.cuda, "mem_get_info", return_value=(reserve + factor_bytes - 1, 8 * reserve)
+        ), mock.patch.object(
+            nodes_module.comfy.model_management, "extra_reserved_memory", return_value=reserve
+        ):
+            preloaded = nodes_module.GGUFModelPatcherDynamic._preload_dynamic_vram_lora_factors(
+                patcher
+            )
+
+        self.assertTrue(preloaded)
+        self.assertEqual(len(moved), 2)
+        self.assertIsNot(lora.weights, original_lora_weights)
+        self.assertIsNot(lokr.weights, original_lokr_weights)
+
+    def test_dynamic_vram_offloads_lora_factors_only_when_enabled(self):
+        nodes_module = nodes_factory()
+        factor = torch.ones((2, 2))
+        adapter = type("FakeLoRAAdapter", (), {"name": "lora", "weights": (factor, 4.0)})()
+        key = "blocks.1.weight"
+        patch_function = type(
+            "FakeLowVramPatch",
+            (),
+            {
+                "is_lowvram_patch": True,
+                "key": key,
+                "patches": {key: [(1.0, adapter, 1.0, None, None)]},
+                "prepared_patches": None,
+            },
+        )()
+        module = type(
+            "FakeLayer", (), {"weight_function": [patch_function], "bias_function": []}
+        )()
+        moved = []
+        patcher = type(
+            "FakeDynamicPatcher",
+            (),
+            {
+                "model": type(
+                    "FakeModel", (), {"named_modules": lambda self: [("layer", module)]}
+                )(),
+                "load_device": torch.device("cuda:0"),
+                "offload_device": torch.device("cpu"),
+                "_move_dynamic_vram_lora_factor": staticmethod(
+                    lambda value, device: moved.append((value, device)) or value.clone()
+                ),
+            },
+        )()
+        reserve = 123456
+
+        with mock.patch.dict(
+            os.environ, {"COMFYUI_GGUF_INT4_LORA_OFFLOAD": "ON"}
+        ), mock.patch.object(torch.cuda, "is_available", return_value=True), mock.patch.object(
+            torch.cuda, "mem_get_info", return_value=(reserve + factor.numel() * factor.element_size() - 1, 8 * reserve)
+        ), mock.patch.object(
+            nodes_module.comfy.model_management, "extra_reserved_memory", return_value=reserve
+        ):
+            preloaded = nodes_module.GGUFModelPatcherDynamic._preload_dynamic_vram_lora_factors(
+                patcher
+            )
+
+        self.assertFalse(preloaded)
+        self.assertFalse(moved)
+        self.assertIs(adapter.weights[0], factor)
+
+    def test_int4_lora_offload_environment_values(self):
+        nodes_module = nodes_factory()
+        for value in ("true", "TRUE", "1", "yes", "On"):
+            with mock.patch.dict(os.environ, {"COMFYUI_GGUF_INT4_LORA_OFFLOAD": value}):
+                self.assertTrue(nodes_module.int4_lora_offload_enabled())
+        for value in ("", "false", "0", "no", "off", "unexpected"):
+            with mock.patch.dict(os.environ, {"COMFYUI_GGUF_INT4_LORA_OFFLOAD": value}):
+                self.assertFalse(nodes_module.int4_lora_offload_enabled())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(nodes_module.int4_lora_offload_enabled())
+
+    def test_dynamic_vram_preload_logs_loaded_models_and_reraises_cuda_oom(self):
+        nodes_module = nodes_factory()
+        factor = torch.ones((2, 2))
+        adapter = type("FakeLoRAAdapter", (), {"name": "lora", "weights": (factor, 4.0)})()
+        key = "blocks.1.weight"
+        patch_function = type(
+            "FakeLowVramPatch",
+            (),
+            {
+                "is_lowvram_patch": True,
+                "key": key,
+                "patches": {key: [(1.0, adapter, 1.0, None, None)]},
+                "prepared_patches": None,
+            },
+        )()
+        module = type(
+            "FakeLayer", (), {"weight_function": [patch_function], "bias_function": []}
+        )()
+        patcher = type(
+            "FakeDynamicPatcher",
+            (),
+            {
+                "model": type(
+                    "FakeModel", (), {"named_modules": lambda self: [("layer", module)]}
+                )(),
+                "load_device": torch.device("cuda:0"),
+                "offload_device": torch.device("cpu"),
+                "_move_dynamic_vram_lora_factor": staticmethod(
+                    mock.Mock(side_effect=torch.OutOfMemoryError("forced preload OOM"))
+                ),
+            },
+        )()
+        loaded_model = type(
+            "FakeLoadedModel",
+            (),
+            {
+                "model": type(
+                    "FakePatcher",
+                    (),
+                    {"model": type("DiffusionModel", (), {"name": "gguf"})(), "size": 3 * 1024**2},
+                )()
+            },
+        )()
+
+        with mock.patch.dict(
+            os.environ, {"COMFYUI_GGUF_INT4_LORA_OFFLOAD": "false"}
+        ), mock.patch.object(torch.cuda, "is_available", return_value=True), mock.patch.object(
+            torch.cuda, "mem_get_info", return_value=(2 * 1024**3, 8 * 1024**3)
+        ), mock.patch.object(
+            nodes_module.comfy.model_management, "extra_reserved_memory", return_value=0
+        ), mock.patch.object(
+            nodes_module.comfy.model_management, "current_loaded_models", [loaded_model]
+        ), self.assertLogs(level="ERROR") as logs:
+            with self.assertRaisesRegex(torch.OutOfMemoryError, "forced preload OOM"):
+                nodes_module.GGUFModelPatcherDynamic._preload_dynamic_vram_lora_factors(
+                    patcher
+                )
+
+        self.assertIn("preloading Dynamic VRAM INT4 LoRA/LoKr factors", logs.output[0])
+        self.assertIn("DiffusionModel (gguf): 3.0 MiB", logs.output[1])
+
+    def test_dynamic_vram_does_not_warn_for_static_lora_patch(self):
+        nodes_module = nodes_factory()
+        module = type(
+            "FakeLayer",
+            (),
+            {"weight_function": [object()], "bias_function": []},
+        )()
+        patcher = type(
+            "FakeDynamicPatcher",
+            (),
+            {
+                "model": type(
+                    "FakeModel",
+                    (),
+                    {"named_modules": lambda self: [("layer", module)]},
+                )(),
+                "load_device": torch.device("cuda:0"),
+                "offload_device": torch.device("cpu"),
+            },
+        )()
+
+        self.assertFalse(
+            nodes_module.GGUFModelPatcherDynamic._warn_dynamic_vram_lora_streaming(
+                patcher
+            )
+        )
 
     def test_performance_log_records_quantized_forward(self):
         import sys
