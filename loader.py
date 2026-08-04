@@ -651,6 +651,30 @@ def gguf_gemma3_tokenizer_loader(path):
     del reader
     return torch.ByteTensor(list(spm.SerializeToString()))
 
+def inject_qwen3vl_detection_markers(sd):
+    """Add visual sentinels when a llama.cpp Qwen3-VL GGUF excludes its vision tower."""
+    ln_key = "model.layers.0.input_layernorm.weight"
+    lm_hidden = int(sd[ln_key].shape[0]) if ln_key in sd else 2560
+    vis_hidden = 1024 if lm_hidden == 2560 else 1152
+    merge_dim = vis_hidden * 4  # spatial_merge_size=2
+
+    if lm_hidden == 5120:
+        # MiniMax H3 uses the truncated Qwen3-VL-32B encoder. Its detector
+        # deliberately checks this unprefixed visual key plus layer 49.
+        marker_key = "visual.deepstack_merger_list.0.norm.weight"
+    else:
+        marker_key = "model.visual.deepstack_merger_list.0.norm.weight"
+
+    sd[marker_key] = torch.zeros(merge_dim)
+    if lm_hidden != 5120:
+        sd["model.visual.merger.linear_fc2.weight"] = torch.zeros(lm_hidden, merge_dim)
+    logging.info(
+        "qwen3vl GGUF: injected visual marker tensor "
+        "(lm_hidden=%d, merge_dim=%d)",
+        lm_hidden,
+        merge_dim,
+    )
+
 def gguf_clip_loader(path, dynamic=False, progress_callback=None):
     sd, extra = gguf_sd_loader(
         path,
@@ -692,21 +716,13 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None):
             sd.update(vsd)
         if arch == "qwen3vl" and "model.visual.deepstack_merger_list.0.norm.weight" not in sd:
             # Standard llama.cpp Qwen3-VL GGUFs omit the visual tower. Without it,
-            # detect_te_model() mis-classifies the state dict as QWEN3_4B/8B (Qwen3 LM)
-            # instead of QWEN3VL_4B/8B, so clip_type=KREA2 never selects the 12-layer
-            # tap encoder and conditioning has shape (B, seq, 2560) instead of (B, seq, 30720).
+            # detect_te_model() mis-classifies the state dict as a Qwen3 LM instead
+            # of Qwen3-VL. MiniMax H3 additionally uses Qwen3-VL-32B truncated to
+            # 50 layers, whose detector relies on an unprefixed visual marker.
             # Inject zero sentinel tensors with shapes that exactly match the model
             # parameters so that load_state_dict(strict=False) doesn't raise a size
             # mismatch error while still satisfying detect_te_model()'s key checks.
-            #   deepstack_merger_list.0.norm  -> LayerNorm(vis_hidden * 4)  shape [merge_dim]
-            #   merger.linear_fc2             -> Linear(merge_dim, lm_hidden) shape [lm_hidden, merge_dim]
-            ln_key = "model.layers.0.input_layernorm.weight"
-            lm_hidden = int(sd[ln_key].shape[0]) if ln_key in sd else 2560
-            vis_hidden = 1024 if lm_hidden == 2560 else 1152  # Qwen3-VL-4B vs 8B
-            merge_dim = vis_hidden * 4  # spatial_merge_size=2
-            sd["model.visual.deepstack_merger_list.0.norm.weight"] = torch.zeros(merge_dim)
-            sd["model.visual.merger.linear_fc2.weight"] = torch.zeros(lm_hidden, merge_dim)
-            logging.info(f"qwen3vl GGUF: injected visual marker tensors (lm_hidden={lm_hidden}, merge_dim={merge_dim}) for model type detection")
+            inject_qwen3vl_detection_markers(sd)
     elif arch == "ideogram":
         # Dequantize Ideogram model for inference
         logging.info("Dequantizing Ideogram model for inference...")

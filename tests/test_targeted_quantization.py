@@ -1,10 +1,12 @@
 import unittest
 from collections import OrderedDict
+import importlib.util
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import gguf
 import torch
+import comfy.sd
 from safetensors.torch import save_file
 
 from tools.convert import (
@@ -15,6 +17,22 @@ from tools.convert import (
     detect_arch,
     plan_target_size_quantization,
 )
+
+
+def load_gguf_loader():
+    loader_path = Path(__file__).parents[1] / "loader.py"
+    package_name = "comfyui_gguf_test"
+    spec = importlib.util.spec_from_file_location(
+        f"{package_name}.loader",
+        loader_path,
+        submodule_search_locations=[str(loader_path.parent)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    import sys
+    sys.modules[package_name] = module
+    sys.modules[f"{package_name}.loader"] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 class TargetSizeQuantizationTests(unittest.TestCase):
@@ -49,6 +67,45 @@ class TargetSizeQuantizationTests(unittest.TestCase):
     def test_reports_minimum_when_target_is_unsupported(self):
         with self.assertRaisesRegex(ValueError, "smallest supported TARGET_SIZE output"):
             plan_target_size_quantization(self.state_dict, self.model_arch, 0.1)
+
+
+class Qwen3VLDetectionMarkerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.loader = load_gguf_loader()
+
+    def test_uses_minimax_32b_detection_marker_for_5120_hidden_size(self):
+        state_dict = {
+            "model.layers.0.input_layernorm.weight": torch.zeros(5120),
+            "model.layers.49.self_attn.q_proj.weight": torch.zeros(1),
+        }
+
+        self.loader.inject_qwen3vl_detection_markers(state_dict)
+
+        self.assertEqual(
+            comfy.sd.detect_te_model(state_dict),
+            comfy.sd.TEModel.QWEN3VL_32B,
+        )
+        self.assertIn("visual.deepstack_merger_list.0.norm.weight", state_dict)
+        self.assertNotIn("model.visual.deepstack_merger_list.0.norm.weight", state_dict)
+        self.assertNotIn("model.visual.merger.linear_fc2.weight", state_dict)
+        self.assertEqual(
+            state_dict["visual.deepstack_merger_list.0.norm.weight"].shape,
+            (4608,),
+        )
+
+    def test_uses_model_prefixed_detection_markers_for_8b(self):
+        state_dict = {
+            "model.layers.0.input_layernorm.weight": torch.zeros(4096),
+        }
+
+        self.loader.inject_qwen3vl_detection_markers(state_dict)
+
+        self.assertIn("model.visual.deepstack_merger_list.0.norm.weight", state_dict)
+        self.assertEqual(
+            state_dict["model.visual.merger.linear_fc2.weight"].shape,
+            (4096, 4608),
+        )
 
 
 class MinimaxH3DetectionTests(unittest.TestCase):
