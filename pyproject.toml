@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfyui-gguf-reboot"
-version = "v26-08-04"
+version = "26.08.05"
 description = "Actively maintained fork of ComfyUI-GGUF node pack with support for new models, INT8 GGUFs and optionally ComfyUI Dynamic VRAM"
 readme = "README.md"
 license = { file = "LICENSE" }
