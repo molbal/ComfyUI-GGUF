@@ -978,6 +978,457 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
         self.assertTrue(torch.equal(weight[:, :, 1], patch_b))
 
 
+class Qwen35GGUFLoaderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.loader = load_gguf_loader()
+
+    def test_qwen35_arch_is_whitelisted(self):
+        self.assertIn("qwen35", self.loader.TXT_ARCH_LIST)
+
+    def test_maps_qwen35_tensor_layout_to_comfyui(self):
+        state_dict = {
+            "token_embd.weight": torch.zeros(1),
+            "output_norm.weight": torch.zeros(1),
+            "output.weight": torch.zeros(1),
+            "blk.0.attn_norm.weight": torch.zeros(1),
+            "blk.0.post_attention_norm.weight": torch.zeros(1),
+            "blk.0.attn_qkv.weight": torch.zeros(1),
+            "blk.0.attn_gate.weight": torch.zeros(1),
+            "blk.0.ssm_a": torch.zeros(1),
+            "blk.0.ssm_dt.bias": torch.zeros(1),
+            "blk.0.ssm_alpha.weight": torch.zeros(1),
+            "blk.0.ssm_beta.weight": torch.zeros(1),
+            "blk.0.ssm_conv1d.weight": torch.zeros(1),
+            "blk.0.ssm_norm.weight": torch.zeros(1),
+            "blk.0.ssm_out.weight": torch.zeros(1),
+            "blk.3.attn_q.weight": torch.zeros(1),
+            "blk.3.attn_k.weight": torch.zeros(1),
+            "blk.3.attn_v.weight": torch.zeros(1),
+            "blk.3.attn_output.weight": torch.zeros(1),
+            "blk.3.attn_q_norm.weight": torch.zeros(1),
+            "blk.3.attn_k_norm.weight": torch.zeros(1),
+            "blk.3.ffn_up.weight": torch.zeros(1),
+            "blk.3.ffn_gate.weight": torch.zeros(1),
+            "blk.3.ffn_down.weight": torch.zeros(1),
+        }
+
+        mapped = self.loader.sd_map_replace(state_dict, self.loader.QWEN35_SD_MAP)
+
+        self.assertIn("model.language_model.embed_tokens.weight", mapped)
+        self.assertIn("model.language_model.norm.weight", mapped)
+        self.assertIn("lm_head.weight", mapped)
+        self.assertIn("model.language_model.layers.0.input_layernorm.weight", mapped)
+        self.assertIn(
+            "model.language_model.layers.0.post_attention_layernorm.weight",
+            mapped,
+        )
+        self.assertIn("model.language_model.layers.0.linear_attn.A_log", mapped)
+        self.assertIn(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight", mapped
+        )
+        self.assertIn(
+            "model.language_model.layers.0.linear_attn.in_proj_z.weight", mapped
+        )
+        self.assertIn(
+            "model.language_model.layers.0.linear_attn.in_proj_a.weight", mapped
+        )
+        self.assertIn(
+            "model.language_model.layers.0.linear_attn.in_proj_b.weight", mapped
+        )
+        self.assertIn(
+            "model.language_model.layers.0.linear_attn.dt_bias", mapped
+        )
+        self.assertIn(
+            "model.language_model.layers.0.linear_attn.conv1d.weight", mapped
+        )
+        self.assertIn(
+            "model.language_model.layers.0.linear_attn.norm.weight", mapped
+        )
+        self.assertIn(
+            "model.language_model.layers.0.linear_attn.out_proj.weight", mapped
+        )
+        self.assertIn("model.language_model.layers.3.self_attn.q_proj.weight", mapped)
+        self.assertIn("model.language_model.layers.3.self_attn.k_proj.weight", mapped)
+        self.assertIn("model.language_model.layers.3.self_attn.v_proj.weight", mapped)
+        self.assertIn("model.language_model.layers.3.self_attn.o_proj.weight", mapped)
+        self.assertIn("model.language_model.layers.3.self_attn.q_norm.weight", mapped)
+        self.assertIn("model.language_model.layers.3.self_attn.k_norm.weight", mapped)
+        self.assertIn("model.language_model.layers.3.mlp.up_proj.weight", mapped)
+        self.assertIn("model.language_model.layers.3.mlp.gate_proj.weight", mapped)
+        self.assertIn("model.language_model.layers.3.mlp.down_proj.weight", mapped)
+
+    def test_qwen35_layout_is_detected_by_installed_comfyui(self):
+        for hidden_size, expected in (
+            (1024, comfy.sd.TEModel.QWEN35_08B),
+            (2048, comfy.sd.TEModel.QWEN35_2B),
+            (2560, comfy.sd.TEModel.QWEN35_4B),
+            (4096, comfy.sd.TEModel.QWEN35_9B),
+            (5120, comfy.sd.TEModel.QWEN35_27B),
+        ):
+            with self.subTest(hidden_size=hidden_size):
+                state_dict = {
+                    "model.language_model.layers.0.linear_attn.A_log": torch.zeros(1),
+                    "model.language_model.layers.0.input_layernorm.weight": torch.zeros(hidden_size),
+                }
+                self.assertEqual(
+                    comfy.sd.detect_te_model(state_dict),
+                    expected,
+                )
+
+    def test_clip_loader_corrects_norms_and_alog(self):
+        norm_stored = torch.full((2560,), 2.0)  # llama.cpp stores w + 1
+        alog_stored = torch.full((32,), -2.0)  # llama.cpp stores -exp(A_log)
+
+        with mock.patch.object(
+            self.loader,
+            "gguf_sd_loader",
+            return_value=(
+                {
+                    "token_embd.weight": torch.zeros((248320, 2560)),
+                    "output_norm.weight": norm_stored.clone(),
+                    "blk.0.attn_norm.weight": norm_stored.clone(),
+                    "blk.0.post_attention_norm.weight": norm_stored.clone(),
+                    "blk.0.ssm_norm.weight": torch.ones(128),
+                    "blk.0.ssm_a": alog_stored.clone(),
+                    "blk.0.attn_qkv.weight": torch.zeros((8192, 2560)),
+                    "blk.3.attn_q_norm.weight": norm_stored.clone(),
+                    "blk.3.attn_k_norm.weight": norm_stored.clone(),
+                },
+                {"arch_str": "qwen35"},
+            ),
+        ), mock.patch.object(
+            self.loader,
+            "gguf_mmproj_loader",
+            return_value={},
+        ):
+            state_dict = self.loader.gguf_clip_loader("Qwen3.5-4B-BF16.gguf")
+
+        expected_log = torch.log(torch.tensor(2.0))
+        self.assertTrue(
+            torch.equal(
+                state_dict["model.language_model.norm.weight"],
+                torch.ones(2560),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                state_dict["model.language_model.layers.0.input_layernorm.weight"],
+                torch.ones(2560),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                state_dict["model.language_model.layers.0.post_attention_layernorm.weight"],
+                torch.ones(2560),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                state_dict["model.language_model.layers.3.self_attn.q_norm.weight"],
+                torch.ones(2560),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                state_dict["model.language_model.layers.3.self_attn.k_norm.weight"],
+                torch.ones(2560),
+            )
+        )
+        # linear_attn.norm is RMSNormGated and must NOT be shifted.
+        self.assertTrue(
+            torch.equal(
+                state_dict["model.language_model.layers.0.linear_attn.norm.weight"],
+                torch.ones(128),
+            )
+        )
+        # A_log is inverted back from -exp(A_log).
+        self.assertTrue(
+            torch.allclose(
+                state_dict["model.language_model.layers.0.linear_attn.A_log"],
+                torch.full((32,), expected_log),
+            )
+        )
+
+    def test_conv1d_kernel_is_unsqueezed_to_depthwise_shape(self):
+        # V channels stored tiled so the corrected kernel equals arange()
+        tiled = [i * 2 for i in range(16)] + [i * 2 + 1 for i in range(16)]
+        with mock.patch.object(
+            self.loader,
+            "gguf_sd_loader",
+            return_value=(
+                {
+                    "blk.0.attn_qkv.weight": torch.zeros((8192, 2560)),
+                    "blk.0.attn_gate.weight": torch.zeros((4096, 2560)),
+                    "blk.0.ssm_a": torch.full((32,), -1.0),
+                    "blk.0.ssm_conv1d.weight": torch.cat(
+                        [
+                            torch.arange(4096).unsqueeze(1).repeat(1, 4),
+                            (torch.arange(4096) + 4096).reshape(32, 128)[tiled]
+                            .reshape(-1)
+                            .unsqueeze(1)
+                            .repeat(1, 4),
+                        ],
+                        dim=0,
+                    ).to(torch.float32),
+                },
+                {"arch_str": "qwen35"},
+            ),
+        ), mock.patch.object(
+            self.loader,
+            "gguf_mmproj_loader",
+            return_value={},
+        ):
+            state_dict = self.loader.gguf_clip_loader("Qwen3.5-4B-BF16.gguf")
+
+        conv = state_dict["model.language_model.layers.0.linear_attn.conv1d.weight"]
+        self.assertEqual(conv.shape, (8192, 1, 4))
+        self.assertTrue(
+            torch.equal(
+                conv[:, 0, :],
+                torch.arange(8192).unsqueeze(1).repeat(1, 4),
+            )
+        )
+
+    def test_reorders_tiled_v_heads_back_to_grouped_order(self):
+        # llama.cpp stores V heads tiled for k=2, v=4: [K0_v0, K1_v0, K0_v1, K1_v1]
+        # i.e. head order [h0, h2, h1, h3]; ComfyUI expects grouped [h0, h1, h2, h3].
+        num_k_heads, num_v_heads, head_dim = 2, 4, 1
+        value_dim = num_v_heads * head_dim
+        key_dim = num_k_heads * head_dim
+        conv_dim = 2 * key_dim + value_dim
+        tiled = [0, 2, 1, 3]
+
+        def head_marked(rows, cols=1):
+            return torch.arange(rows, dtype=torch.float32).unsqueeze(1).repeat(1, cols)
+
+        # stored rows/cols encode their V-head index in TILED order
+        v_stored = head_marked(value_dim, 3)[tiled]
+        prefix = "model.language_model.layers.0.linear_attn."
+        qkv = torch.cat(
+            [head_marked(key_dim, 3), head_marked(key_dim, 3), v_stored], dim=0
+        )
+        conv = torch.cat(
+            [
+                torch.arange(2 * key_dim, dtype=torch.float32).unsqueeze(1).repeat(1, 2),
+                (torch.arange(value_dim, dtype=torch.float32) + 2 * key_dim)
+                [tiled].unsqueeze(1).repeat(1, 2),
+            ],
+            dim=0,
+        )
+        sd = {
+            prefix + "in_proj_qkv.weight": qkv,
+            prefix + "in_proj_z.weight": v_stored,
+            prefix + "in_proj_a.weight": head_marked(num_v_heads)[tiled],
+            prefix + "in_proj_b.weight": head_marked(num_v_heads)[tiled],
+            prefix + "A_log": torch.full((num_v_heads,), -1.0),
+            prefix + "dt_bias": torch.arange(num_v_heads, dtype=torch.float32)[tiled],
+            prefix + "conv1d.weight": conv,
+            prefix + "out_proj.weight": head_marked(3, value_dim)[:, tiled],
+            "model.language_model.layers.0.input_layernorm.weight": torch.full((4,), 2.0),
+        }
+
+        corrected = self.loader.qwen35_corrections(sd)
+
+        qkv = corrected[prefix + "in_proj_qkv.weight"]
+        self.assertTrue(torch.equal(qkv[: 2 * key_dim], head_marked(key_dim, 3).repeat(2, 1)))
+        self.assertTrue(torch.equal(qkv[2 * key_dim:], head_marked(value_dim, 3)))
+        self.assertTrue(torch.equal(corrected[prefix + "in_proj_z.weight"], head_marked(value_dim, 3)))
+        self.assertTrue(torch.equal(corrected[prefix + "in_proj_a.weight"], head_marked(num_v_heads)))
+        self.assertTrue(torch.equal(corrected[prefix + "in_proj_b.weight"], head_marked(num_v_heads)))
+        self.assertTrue(torch.equal(corrected[prefix + "A_log"], torch.zeros(num_v_heads)))
+        self.assertTrue(
+            torch.equal(
+                corrected[prefix + "dt_bias"],
+                torch.arange(num_v_heads, dtype=torch.float32),
+            )
+        )
+        conv = corrected[prefix + "conv1d.weight"]
+        self.assertEqual(conv.shape, (conv_dim, 1, 2))
+        self.assertTrue(
+            torch.equal(
+                conv[:, 0, :],
+                torch.arange(conv_dim, dtype=torch.float32).unsqueeze(1).repeat(1, 2),
+            )
+        )
+        self.assertTrue(
+            torch.equal(corrected[prefix + "out_proj.weight"], head_marked(3, value_dim))
+        )
+        # unshifted norm
+        self.assertTrue(
+            torch.equal(
+                corrected["model.language_model.layers.0.input_layernorm.weight"],
+                torch.ones(4),
+            )
+        )
+
+    def test_reorders_quantized_tiled_v_heads(self):
+        num_k_heads, num_v_heads, head_dim = 2, 4, 1
+        value_dim = num_v_heads * head_dim
+        tiled = [0, 2, 1, 3]
+        v_stored = torch.arange(value_dim, dtype=torch.float32).unsqueeze(1)[tiled]
+        q_tensor = self.loader.GGMLTensor(
+            v_stored.to(torch.bfloat16),
+            tensor_type=gguf.GGMLQuantizationType.BF16,
+            tensor_shape=v_stored.shape,
+        )
+        reordered = self.loader._qwen35_v_reorder(
+            q_tensor, num_v_heads, num_k_heads, head_dim
+        )
+        self.assertFalse(self.loader.is_quantized(reordered))
+        self.assertTrue(
+            torch.equal(
+                reordered.float(),
+                torch.arange(value_dim, dtype=torch.float32).unsqueeze(1),
+            )
+        )
+
+    def test_v_head_reorder_is_identity_for_balanced_heads(self):
+        num_k_heads, num_v_heads = 16, 16
+        head_dim = 2
+        value_dim = num_v_heads * head_dim
+        key_dim = num_k_heads * head_dim
+        conv_dim = 2 * key_dim + value_dim
+        prefix = "model.language_model.layers.0.linear_attn."
+        sd = {
+            prefix + "in_proj_qkv.weight": torch.arange(conv_dim * 3, dtype=torch.float32).reshape(conv_dim, 3),
+            prefix + "in_proj_z.weight": torch.arange(value_dim * 3, dtype=torch.float32).reshape(value_dim, 3),
+            prefix + "A_log": torch.full((num_v_heads,), -1.0),
+            prefix + "dt_bias": torch.arange(num_v_heads, dtype=torch.float32),
+            prefix + "conv1d.weight": torch.arange(conv_dim * 4, dtype=torch.float32).reshape(conv_dim, 4),
+            prefix + "out_proj.weight": torch.arange(3 * value_dim, dtype=torch.float32).reshape(3, value_dim),
+        }
+
+        corrected = self.loader.qwen35_corrections(sd)
+
+        conv = corrected[prefix + "conv1d.weight"]
+        self.assertEqual(conv.shape, (conv_dim, 1, 4))
+        self.assertTrue(
+            torch.equal(conv[:, 0, :], torch.arange(conv_dim * 4).reshape(conv_dim, 4))
+        )
+        self.assertTrue(
+            torch.equal(
+                corrected[prefix + "in_proj_qkv.weight"],
+                sd[prefix + "in_proj_qkv.weight"],
+            )
+        )
+        self.assertTrue(
+            torch.equal(corrected[prefix + "out_proj.weight"], sd[prefix + "out_proj.weight"])
+        )
+
+    def test_clip_loader_dequantizes_quantized_lm_head(self):
+        # BaseGenerate.logits() feeds lm_head straight to F.linear without
+        # dequantizing GGML tensors, so a Q8_0 head (raw bytes with scales
+        # interleaved) must arrive dequantized with its logical shape.
+        with mock.patch.object(
+            self.loader,
+            "gguf_sd_loader",
+            return_value=(
+                {
+                    "token_embd.weight": torch.zeros((248320, 4096)),
+                    "output.weight": self.loader.GGMLTensor(
+                        torch.zeros((248320, 4352), dtype=torch.uint8),
+                        tensor_type=gguf.GGMLQuantizationType.Q8_0,
+                        tensor_shape=(248320, 4096),
+                    ),
+                    "blk.0.attn_qkv.weight": torch.zeros((8192, 4096)),
+                    "blk.0.attn_gate.weight": torch.zeros((4096, 4096)),
+                    "blk.0.ssm_a": torch.full((32,), -1.0),
+                },
+                {"arch_str": "qwen35"},
+            ),
+        ), mock.patch.object(
+            self.loader,
+            "gguf_mmproj_loader",
+            return_value={},
+        ):
+            state_dict = self.loader.gguf_clip_loader("Qwen3.5-9B-Q8_0.gguf")
+
+        head = state_dict["lm_head.weight"]
+        self.assertFalse(self.loader.is_quantized(head))
+        self.assertEqual(head.shape, (248320, 4096))
+
+    def test_clip_loader_keeps_bf16_lm_head_quantized(self):
+        # BF16 storage keeps its logical shape, so Dynamic VRAM can keep it
+        # quantized and offloaded; only block-quantized heads are unsafe.
+        bf16_head = self.loader.GGMLTensor(
+            torch.zeros((248320, 4096), dtype=torch.bfloat16),
+            tensor_type=gguf.GGMLQuantizationType.BF16,
+            tensor_shape=(248320, 4096),
+        )
+        with mock.patch.object(
+            self.loader,
+            "gguf_sd_loader",
+            return_value=(
+                {
+                    "token_embd.weight": torch.zeros((248320, 4096)),
+                    "output.weight": bf16_head,
+                    "blk.0.attn_qkv.weight": torch.zeros((8192, 4096)),
+                    "blk.0.attn_gate.weight": torch.zeros((4096, 4096)),
+                    "blk.0.ssm_a": torch.full((32,), -1.0),
+                },
+                {"arch_str": "qwen35"},
+            ),
+        ), mock.patch.object(
+            self.loader,
+            "gguf_mmproj_loader",
+            return_value={},
+        ):
+            state_dict = self.loader.gguf_clip_loader("Qwen3.5-9B-BF16.gguf")
+
+        head = state_dict["lm_head.weight"]
+        self.assertTrue(self.loader.is_quantized(head))
+        self.assertEqual(head.shape, (248320, 4096))
+
+    def test_mmproj_routes_fused_qkv_through_qwen3_vision_map(self):
+        with TemporaryDirectory() as temp_dir:
+            text_encoder = Path(temp_dir) / "Qwen3.5-4B-Q8_0.gguf"
+            mmproj = Path(temp_dir) / "mmproj-Qwen3.5-4B-BF16.gguf"
+            text_encoder.touch()
+            mmproj.touch()
+
+            with mock.patch.object(
+                self.loader,
+                "gguf_sd_loader",
+                return_value=(
+                    {
+                        "v.blk.0.attn_qkv.weight": torch.ones((1024, 3072)),
+                        "v.blk.0.attn_out.weight": torch.ones((1024, 1024)),
+                        "v.blk.0.ln1.weight": torch.ones(1024),
+                        "v.blk.0.ln2.weight": torch.ones(1024),
+                        "v.blk.0.ffn_up.weight": torch.ones((1024, 4096)),
+                        "v.blk.0.ffn_down.weight": torch.ones((4096, 1024)),
+                        "v.patch_embd.weight": torch.ones((2, 3, 2, 2)),
+                        "v.patch_embd.weight.1": torch.full((2, 3, 2, 2), 2.0),
+                        "v.patch_embd.bias": torch.ones(1024),
+                        "v.position_embd.weight": torch.ones((1024, 2304)),
+                        "mm.0.weight": torch.ones(1),
+                        "mm.2.weight": torch.ones(1),
+                        "v.post_ln.weight": torch.ones(1024),
+                    },
+                    {},
+                ),
+            ):
+                mapped = self.loader.gguf_mmproj_loader(str(text_encoder))
+
+        self.assertIn("model.visual.blocks.0.attn.qkv.weight", mapped)
+        self.assertIn("model.visual.blocks.0.attn.proj.weight", mapped)
+        self.assertIn("model.visual.blocks.0.norm1.weight", mapped)
+        self.assertIn("model.visual.blocks.0.norm2.weight", mapped)
+        self.assertIn("model.visual.blocks.0.mlp.linear_fc1.weight", mapped)
+        self.assertIn("model.visual.blocks.0.mlp.linear_fc2.weight", mapped)
+        self.assertIn("model.visual.patch_embed.proj.weight", mapped)
+        self.assertIn("model.visual.patch_embed.proj.bias", mapped)
+        self.assertIn("visual.pos_embed.weight", mapped)
+        self.assertIn("model.visual.merger.linear_fc1.weight", mapped)
+        self.assertIn("model.visual.merger.linear_fc2.weight", mapped)
+        self.assertIn("model.visual.merger.norm.weight", mapped)
+        self.assertEqual(
+            mapped["model.visual.patch_embed.proj.weight"].shape,
+            (2, 3, 2, 2, 2),
+        )
+
+
 class Qwen3VLQuantizationTests(unittest.TestCase):
     def test_supports_quant_types_used_by_pruned_32b_gguf(self):
         for quant_name in ("IQ3_S", "IQ3_XXS", "IQ2_S", "IQ2_XS"):

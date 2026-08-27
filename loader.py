@@ -13,7 +13,7 @@ from .dequant import is_quantized, dequantize_tensor
 from .quant_ops import make_quantized
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "ltxv_upscaler", "hyvid", "wan", "lumina2", "qwen_image", "ideogram", "krea2", "minimax_h3", "minimax_h3_vae", "minimax_music3"}
-TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "gemma4", "minimax_music3"}
+TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "qwen35", "gemma3", "gemma4", "minimax_music3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
 def device_supports_bf16():
@@ -402,6 +402,40 @@ GEMMA4_SD_MAP = {
     **GEMMA3_SD_MAP,
 }
 
+# Qwen3.5 (llama.cpp ``qwen35`` arch). ComfyUI's detect_te_model() identifies
+# Qwen3.5 by the unprefixed ``model.language_model.*`` layout before applying
+# its own prefix rename, so the LM must map with that prefix. Hybrid layers
+# carry linear attention (``attn_qkv``/``attn_gate``/``ssm_*`` tensors); the
+# second layernorm is exported as ``post_attention_norm`` (no ``ffn_norm``).
+# Entry order matters because sd_map_replace() does substring replacement:
+# the fused/SSM variants must precede the generic ``attn_q``/``ssm_a`` keys.
+QWEN35_SD_MAP = {
+    "blk.": "model.language_model.layers.",
+    "attn_norm": "input_layernorm",
+    "attn_q_norm.": "self_attn.q_norm.",
+    "attn_k_norm.": "self_attn.k_norm.",
+    "attn_qkv": "linear_attn.in_proj_qkv",
+    "attn_gate": "linear_attn.in_proj_z",
+    "attn_q": "self_attn.q_proj",
+    "attn_k": "self_attn.k_proj",
+    "attn_v": "self_attn.v_proj",
+    "attn_output": "self_attn.o_proj",
+    "ssm_alpha": "linear_attn.in_proj_a",
+    "ssm_beta": "linear_attn.in_proj_b",
+    "ssm_conv1d": "linear_attn.conv1d",
+    "ssm_dt.bias": "linear_attn.dt_bias",
+    "ssm_norm": "linear_attn.norm",
+    "ssm_out": "linear_attn.out_proj",
+    "ssm_a": "linear_attn.A_log",
+    "post_attention_norm": "post_attention_layernorm",
+    "ffn_up": "mlp.up_proj",
+    "ffn_down": "mlp.down_proj",
+    "ffn_gate": "mlp.gate_proj",
+    "token_embd": "model.language_model.embed_tokens",
+    "output_norm": "model.language_model.norm",
+    "output.weight": "lm_head.weight",
+}
+
 CLIP_VISION_SD_MAP = {
     "mm.": "visual.merger.mlp.",
     "v.post_ln.": "visual.merger.ln_q.",
@@ -482,6 +516,137 @@ def gemma3_norm_corrections(sd):
     #logging.info(f"Gemma3: Applied -1 norm correction to {corrected} tensors")
     return sd
 
+def _qwen35_v_reorder(value, num_v_heads, num_k_heads, head_dim, qk_rows=0, axis=0):
+    """Reverse llama.cpp's tiled V-head order for linear attention.
+
+    llama.cpp (``_LinearAttentionVReorderBase``) stores V heads in tiled
+    order ``[K0_v0, K1_v0, ..., K0_v1, K1_v1, ...]`` so its kernels can
+    broadcast K with ``ggml_repeat``. ComfyUI expects the grouped-by-K-head
+    order ``[K0_v0..v{r-1}, K1_v0..v{r-1}, ...]`` that the HF checkpoints
+    use. Quantized tensors are dequantized first because the head blocks
+    do not align with every GGML quant block size. ``qk_rows`` skips the
+    untouched Q/K rows of fused tensors; ``axis=1`` reorders columns.
+    """
+    if num_k_heads <= 0 or num_v_heads <= num_k_heads:
+        return value
+    if is_quantized(value):
+        dtype = torch.bfloat16 if device_supports_bf16() else torch.float16
+        value = dequantize_tensor(value, dtype=dtype)
+    r = num_v_heads // num_k_heads
+    # grouped head g = (k_idx, v_idx); its tiled position is v_idx * k + k_idx
+    src = [(g % r) * num_k_heads + (g // r) for g in range(num_v_heads)]
+    idx = torch.tensor(src, dtype=torch.long)
+    if value.ndim == 1:
+        return value.index_select(0, idx)
+    if qk_rows > 0:
+        # fused qkv / conv1d: only the V block is reordered
+        head_rows = value.shape[0] - qk_rows
+        v = value[qk_rows:].view(num_v_heads, -1).index_select(0, idx)
+        v = v.reshape(head_rows, value.shape[1])
+        return torch.cat([value[:qk_rows], v], dim=0)
+    if axis == 1:
+        return (
+            value.view(-1, num_v_heads, head_dim)
+            .index_select(1, idx)
+            .reshape(value.shape)
+        )
+    return value.view(num_v_heads, -1).index_select(0, idx).reshape(value.shape)
+
+def qwen35_corrections(sd):
+    # Reverse llama.cpp's Qwen3.5 conversion tweaks (see Qwen3NextModel and
+    # _LinearAttentionVReorderBase modify_tensors in llama.cpp): it stores
+    # RMS norm weights as (w + 1), stores ``ssm_a`` as ``-exp(A_log)``,
+    # squeezes the depthwise conv1d kernels to 2D, and stores linear-attention
+    # V heads in tiled order. ComfyUI's Qwen35 TE expects the raw weights and
+    # applies ``w + 1`` and ``-exp(A_log)`` itself.
+    norm_patterns = [
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+        "model.language_model.norm.weight",
+    ]
+    corrected = 0
+    for key in list(sd.keys()):
+        if any(p in key for p in norm_patterns):
+            if is_quantized(sd[key]):
+                sd[key] = dequantize_tensor(sd[key], dtype=torch.float32) - 1.0
+            else:
+                sd[key] = sd[key].float() - 1.0
+            corrected += 1
+
+    # derive the linear-attention head layout from the checkpoint shapes
+    qkv_key = next((k for k in sd if k.endswith(".linear_attn.in_proj_qkv.weight")), None)
+    z_key = next((k for k in sd if k.endswith(".linear_attn.in_proj_z.weight")), None)
+    alog_key = next((k for k in sd if k.endswith(".linear_attn.A_log")), None)
+    num_k_heads = num_v_heads = head_dim = 0
+    if qkv_key and z_key and alog_key:
+        value_dim = sd[z_key].shape[0]
+        conv_dim = sd[qkv_key].shape[0]
+        key_dim = (conv_dim - value_dim) // 2
+        num_v_heads = sd[alog_key].shape[0]
+        head_dim = value_dim // num_v_heads
+        num_k_heads = key_dim // head_dim
+
+    for key in list(sd.keys()):
+        if key.endswith(".linear_attn.A_log"):
+            # llama.cpp stores ``ssm_a = -exp(A_log)`` (always negative);
+            # ComfyUI computes ``-A_log.exp()``, so invert back to A_log.
+            value = sd[key]
+            if is_quantized(value):
+                value = dequantize_tensor(value, dtype=torch.float32)
+            else:
+                value = value.float()
+            sd[key] = torch.log(-value)
+            corrected += 1
+        elif key.endswith(".linear_attn.dt_bias"):
+            corrected += 1
+        elif key.endswith(".linear_attn.conv1d.weight"):
+            corrected += 1
+        elif key.endswith(".linear_attn.in_proj_qkv.weight"):
+            corrected += 1
+        elif key.endswith((
+            ".linear_attn.in_proj_z.weight",
+            ".linear_attn.in_proj_a.weight",
+            ".linear_attn.in_proj_b.weight",
+        )):
+            corrected += 1
+        elif key.endswith(".linear_attn.out_proj.weight"):
+            corrected += 1
+        else:
+            continue
+
+        # reverse the tiled V-head order (identity when heads are balanced)
+        if key.endswith((".linear_attn.A_log", ".linear_attn.dt_bias")):
+            sd[key] = _qwen35_v_reorder(sd[key], num_v_heads, num_k_heads, 1)
+        elif key.endswith(".linear_attn.conv1d.weight"):
+            value = sd[key]
+            if value.ndim == 2:
+                conv_dim = value.shape[0]
+                qk_channels = conv_dim - num_v_heads * head_dim
+                # llama.cpp squeezes the depthwise conv1d kernel to 2D
+                # (out_channels, kernel_size); ComfyUI's Conv1d expects
+                # (out_channels, 1, kernel_size).
+                value = _qwen35_v_reorder(
+                    value, num_v_heads, num_k_heads, head_dim, qk_rows=qk_channels
+                )
+                sd[key] = value.unsqueeze(-2)
+        elif key.endswith(".linear_attn.in_proj_qkv.weight"):
+            value = sd[key]
+            qk_rows = value.shape[0] - num_v_heads * head_dim
+            sd[key] = _qwen35_v_reorder(
+                value, num_v_heads, num_k_heads, head_dim, qk_rows=qk_rows
+            )
+        elif key.endswith(".linear_attn.out_proj.weight"):
+            sd[key] = _qwen35_v_reorder(
+                sd[key], num_v_heads, num_k_heads, head_dim, axis=1
+            )
+        else:
+            sd[key] = _qwen35_v_reorder(sd[key], num_v_heads, num_k_heads, 1)
+
+    logging.info(f"qwen35 GGUF: corrected {corrected} norm/A_log/conv1d/V-head tensors")
+    return sd
+
 def strip_quant_suffix(name):
     pattern = r"[-_]?(?:ud-)?i?q[0-9]_[a-z0-9_\-]{1,8}$"
     match = re.search(pattern, name, re.IGNORECASE)
@@ -526,7 +691,10 @@ def gguf_mmproj_loader(path):
         w2 = dequantize_tensor(vsd.pop("v.patch_embd.weight.1"), dtype=torch.float32)
         vsd["v.patch_embd.weight"] = torch.stack([w1, w2], dim=2)
 
-    if any("deepstack" in key or "deepstast" in key for key in vsd):
+    if any("deepstack" in key or "deepstast" in key or "attn_qkv" in key for key in vsd):
+        # Qwen3-VL / Qwen3.5 style vision towers use fused ``v.blk.N.attn_qkv``
+        # projections and a ``linear_fc`` merger. Qwen3.5 mmprojs omit the
+        # deepstack tensors, so detect them by the fused projection instead.
         return sd_map_replace(vsd, CLIP_VISION_QWEN3_MAP)
 
     # run main replacement
@@ -799,7 +967,7 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None):
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         sd = sd_map_replace(sd, T5_SD_MAP)
-    elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3", "gemma4"}:
+    elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "qwen35", "gemma3", "gemma4"}:
         # TODO: pass model_options["vocab_size"] to loader somehow
         temb_key = "token_embd.weight"
         if temb_key in sd and sd[temb_key].shape[0] >= (64 * 1024):
@@ -820,6 +988,11 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None):
             # ComfyUI calculates Gemma 4 RoPE frequencies itself.
             sd.pop("rope_freqs.weight", None)
             sd = sd_map_replace(sd, GEMMA4_SD_MAP)
+        elif arch == "qwen35":
+            sd = sd_map_replace(sd, QWEN35_SD_MAP)
+            sd = qwen35_corrections(sd)
+            vsd = gguf_mmproj_loader(path)
+            sd.update(vsd)
         else:
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch == "llama":
@@ -851,6 +1024,17 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None):
             # parameters so that load_state_dict(strict=False) doesn't raise a size
             # mismatch error while still satisfying detect_te_model()'s key checks.
             inject_qwen3vl_detection_markers(sd)
+        if "lm_head.weight" in sd and is_quantized(sd["lm_head.weight"]):
+            lm_head = sd["lm_head.weight"]
+            if getattr(lm_head, "tensor_type", None) != gguf.GGMLQuantizationType.BF16:
+                # BaseGenerate.logits() feeds lm_head straight to F.linear,
+                # bypassing the GGML ops path that dequantizes on the fly.
+                # Block-quantized GGUF data has a byte-expanded shape (e.g.
+                # Q8_0 stores scales interleaved), so raw data must never
+                # reach the matmul. BF16 storage is already full precision
+                # and keeps its logical shape, so it can stay quantized.
+                logging.warning(f"Dequantizing lm_head.weight to prevent raw-block matmul.")
+                sd["lm_head.weight"] = dequantize_tensor(lm_head, dtype=torch.float16)
     elif arch == "ideogram":
         # Dequantize Ideogram model for inference
         logging.info("Dequantizing Ideogram model for inference...")
