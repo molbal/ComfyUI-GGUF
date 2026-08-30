@@ -381,6 +381,170 @@ def get_gguf_q8_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
     return GGUFQ8Ops
 
 
+# Q4_CR: custom W4A16 INT4 format backed by comfy_kitchen's AWQ GEMV.
+# Weights stay IN4-packded in VRAM (N, K//2 int8 + per-group fp scales/zeros)
+# and matmul dispatches to the native ck.gemv_awq_w4a16 tensor-core kernel.
+# The ops class mirrors RetiredGGUFQ4Ops: it owns its _load_from_state_dict
+# (ComfyUI's _load_quantized_module doesn't know int4_cr), builds the kitchen
+# QuantizedTensor lazily per-forward, and falls back to dequant on non-CUDA.
+def get_gguf_q4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
+    try:
+        from comfy_kitchen.tensor.awq_w4a16 import TensorCoreAWQW4A16Layout
+        from comfy_kitchen.tensor.base import QuantizedTensor
+        import comfy_kitchen as ck
+        _HAVE_KITCHEN = True
+    except Exception:
+        TensorCoreAWQW4A16Layout = None
+        QuantizedTensor = None
+        ck = None
+        _HAVE_KITCHEN = False
+
+    class GGUFQ4Ops(comfy.ops.disable_weight_init):
+        class Linear(torch.nn.Module, comfy.ops.CastWeightBiasOp):
+            comfy_cast_weights = True
+
+            def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
+                torch.nn.Module.__init__(self)
+                self.in_features = in_features
+                self.out_features = out_features
+                self.weight = None
+                self.register_parameter("bias", None)
+                self._orig_shape = (out_features, in_features)
+                self._group_size = 64
+                self._quantized = False
+                self._orig_in_features = in_features
+                self.weight_scale = None
+                self.weight_zeros = None
+
+            def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs):
+                weight_key = f"{prefix}weight"
+                scale_key = f"{prefix}weight_scale"
+                zeros_key = f"{prefix}weight_zeros"
+                quant_key = f"{prefix}comfy_quant"
+
+                weight = state_dict.pop(weight_key, None)
+                scale = state_dict.pop(scale_key, None)
+                zeros = state_dict.pop(zeros_key, None)
+                quant_raw = state_dict.pop(quant_key, None)
+
+                bias_key = f"{prefix}bias"
+                bias = state_dict.pop(bias_key, None)
+                if bias is not None:
+                    self.bias = torch.nn.Parameter(bias, requires_grad=False)
+                else:
+                    self.bias = None
+                if bias_key in missing_keys:
+                    missing_keys.remove(bias_key)
+
+                if quant_raw is None or weight is None:
+                    # Plain (non-quantized) Linear: keep the raw weight.
+                    if weight is None:
+                        missing_keys.append(weight_key)
+                        return
+                    self.weight = torch.nn.Parameter(
+                        weight if isinstance(weight, torch.Tensor) else torch.Tensor(weight),
+                        requires_grad=False,
+                    )
+                    self._quantized = False
+                    return
+
+                if scale is None:
+                    raise RuntimeError(f"Missing Q4_CR scale tensor for {prefix}")
+
+                quant_conf = json.loads(bytes(quant_raw.tolist()).decode("utf-8"))
+                if quant_conf.get("format") != "int4_cr":
+                    raise ValueError(f"Unsupported Q4_CR format for {prefix}: {quant_conf.get('format')!r}")
+                self._group_size = quant_conf.get("group_size", 64)
+                self._orig_shape = tuple(quant_conf.get("orig_shape", (self.out_features, self.in_features)))
+                self.out_features = self._orig_shape[0]
+                self.in_features = self._orig_shape[1]
+
+                self.weight = torch.nn.Parameter(weight, requires_grad=False)
+                self.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+                self.weight_zeros = torch.nn.Parameter(zeros, requires_grad=False) if zeros is not None else None
+                self._quantized = True
+
+            def _build_quantized_weight(self, device, dtype):
+                if not _HAVE_KITCHEN:
+                    return None
+                if self.weight_zeros is not None:
+                    zeros = self.weight_zeros.to(device=device, dtype=dtype)
+                else:
+                    zeros = torch.zeros_like(self.weight_scale.to(device=device, dtype=dtype))
+                scale = self.weight_scale.to(device=device, dtype=dtype).contiguous()
+                zeros = zeros.contiguous()
+                packed = self.weight.to(device=device).to(torch.int8)
+                g = self._group_size
+                params = TensorCoreAWQW4A16Layout.Params(
+                    scale=scale,
+                    zeros=zeros,
+                    orig_dtype=dtype,
+                    orig_shape=self._orig_shape,
+                    group_size=g,
+                )
+                return QuantizedTensor(packed, "TensorCoreAWQW4A16Layout", params)
+
+            def forward_comfy_cast_weights(self, input, *args, **kwargs):
+                bias = self.bias.to(device=input.device, dtype=input.dtype) if self.bias is not None else None
+                if not self._quantized or self.weight is None:
+                    # Plain Linear path
+                    weight = self.weight.to(device=input.device, dtype=input.dtype)
+                    return torch.nn.functional.linear(input, weight, bias)
+                if self.weight_function or self.bias_function:
+                    # LoRA/patch path: dequantize and fall back to a full-precision matmul.
+                    _orig_w = self._dequantized_weight(input.device, input.dtype)
+                    return torch.nn.functional.linear(input, _orig_w, bias)
+
+                weight_qt = self._build_quantized_weight(input.device, input.dtype)
+                if weight_qt is None:
+                    # No comfy_kitchen / non-CUDA: dequant fallback.
+                    _orig_w = self._dequantized_weight(input.device, input.dtype)
+                    return torch.nn.functional.linear(input, _orig_w, bias)
+
+                out = torch.nn.functional.linear(input, weight_qt)
+                if bias is not None:
+                    out = out + bias
+                return out
+
+            def forward(self, *args, **kwargs):
+                # ComfyUI's disable_weight_init.Linear provides 'forward', but this
+                # class subclasses (torch.nn.Module, CastWeightBiasOp) directly, so
+                # 'forward' is not inherited. Route through forward_comfy_cast_weights
+                # (matching the Q8/serial dispatch) so the native INT4 kernel is used.
+                comfy.ops.run_every_op()
+                if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
+                    return self.forward_comfy_cast_weights(*args, **kwargs)
+                return torch.nn.functional.linear(
+                    input=args[0],
+                    weight=self.weight,
+                    bias=self.bias,
+                )
+
+            def _dequantized_weight(self, device, dtype):
+                packed = self.weight.to(device=device).to(torch.int8)
+                scale = self.weight_scale.to(device=device, dtype=dtype)
+                zeros = (self.weight_zeros if self.weight_zeros is not None
+                         else torch.zeros_like(scale)).to(device=device, dtype=dtype)
+                n, k_half = packed.shape
+                k = k_half * 2
+                g = self._group_size
+                x32 = packed.to(torch.int32)
+                lo = (x32 & 0xF).to(torch.int8)
+                hi = ((x32 >> 4) & 0xF).to(torch.int8)
+                nibbles = torch.stack([lo, hi], dim=-1).reshape(n, k).to(dtype)
+                w = (
+                    (nibbles.view(n, k // g, g) - 8.0) * scale.t().unsqueeze(-1)
+                    + zeros.t().unsqueeze(-1)
+                ).view(n, k)
+                return w
+
+        def reset_parameters(self):
+            return None
+
+    return GGUFQ4Ops
+
+
 # Retired experimental Q4_PT implementation. No loader or node runtime path
 # references this class until a performant W4A16 backend is available.
 class RetiredGGUFQ4Ops(comfy.ops.manual_cast):
