@@ -177,7 +177,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         tensor_name
         for key, quant_conf in custom_quant_configs.items()
         if quant_conf.get("format") == "int4_cr"
-        for tensor_name in (key, f"{key}_scale", f"{key}_zeros")
+        for tensor_name in (key, f"{key}_scale")
     }
 
     # main loading loop
@@ -326,43 +326,40 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             )
             extra["gguf_quant_mode"] = "int8_convrot"
 
-        # Q4_CR: custom W4A16 INT4 backed by comfy_kitchen's AWQ GEMV.
-        # Store the packed int4 weight as (N, K//2) int8 with per-group fp
-        # scales/zeros. The output dim (rows) is preserved so ComfyUI's model
-        # detector (which reads shape[0] of quantized linears) still works;
-        # input-feature reads in the detector are on keys_hiprec tensors that
-        # stay in full precision.
-        elif fmt == "int4_cr":
+        # Q4_CR_W4A4: custom W4A4 INT4 backed by comfy_kitchen's fast ConvRot
+        # int4 tensor-core MMA. On-disk is kitchen-native packed int4 (N, K//2)
+        # int8 + a per-output-row fp16 scale; no per-group scales/zeros.
+        # The weight is pre-rotated by a block-diagonal Hadamard along K, matching
+        # the activation rotation the kernel applies at runtime.
+        elif fmt == "int4_cr" and quant_conf.get("backing") == "w4a4":
             orig_shape = torch.Size(tuple(quant_conf["orig_shape"]))
-            group_size = quant_conf.get("group_size", 64)
+            convrot_groupsize = quant_conf.get("convrot_groupsize", 256)
+            quant_group_size = quant_conf.get("quant_group_size", 64)
             packed_shape = (orig_shape[0], orig_shape[1] // 2)
 
-            weight_ggml_ = weight_ggml
             if dynamic:
-                packed = weight_ggml_.view(torch.int8).reshape(orig_shape[0], orig_shape[1] // 2)
-                scale = scale_ggml.view(torch.float16).to(torch.bfloat16)
-                zeros_tensor = state_dict.pop(f"{key}_zeros", None)
-                zeros = zeros_tensor.view(torch.float16).to(torch.bfloat16) if zeros_tensor is not None else None
+                packed = weight_ggml.view(torch.int8).reshape(packed_shape)
+                scale = scale_ggml.view(torch.float16).to(torch.bfloat16).reshape(orig_shape[0])
             else:
-                packed = weight_ggml_.data.view(torch.int8).reshape(packed_shape)
-                scale = scale_ggml.data.view(torch.float16).to(torch.bfloat16).reshape(scale_ggml.tensor_shape)
-                zeros_tensor = state_dict.pop(f"{key}_zeros", None)
-                if zeros_tensor is not None:
-                    zeros = zeros_tensor.data.view(torch.float16).to(torch.bfloat16).reshape(zeros_tensor.tensor_shape)
-                else:
-                    zeros = None
+                packed = weight_ggml.data.view(torch.int8).reshape(packed_shape)
+                scale = scale_ggml.data.view(torch.float16).to(torch.bfloat16).reshape(orig_shape[0])
 
             layer_prefix = weight_key[:weight_key.rfind("weight")]
 
             state_dict[weight_key] = torch.nn.Parameter(packed, requires_grad=False)
             state_dict[scale_key] = torch.nn.Parameter(scale, requires_grad=False)
-            if zeros is not None:
-                state_dict[f"{key}_zeros"] = torch.nn.Parameter(zeros, requires_grad=False)
             state_dict[f"{layer_prefix}comfy_quant"] = torch.nn.Parameter(
                 torch.tensor(list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8),
                 requires_grad=False,
             )
-            extra["gguf_quant_mode"] = "int4_cr"
+            extra["gguf_quant_mode"] = "int4_cr_w4a4"
+
+        elif fmt == "int4_cr":
+            # The retired W4A16 (AWQ GEMV) Q4_CR format is no longer supported.
+            raise ValueError(
+                "This Q4_CR GGUF uses the retired W4A16 backing (no 'backing': 'w4a4'). "
+                "Reconvert with --quant-type Q4_CR_W4A4."
+            )
 
     return (state_dict, extra)
 

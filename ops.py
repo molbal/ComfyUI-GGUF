@@ -9,6 +9,24 @@ import comfy.lora
 import comfy.model_management
 from .dequant import dequantize_tensor, is_quantized
 
+def _build_regular_hadamard(size, dtype=torch.float32, device="cpu"):
+    """Build a normalized regular (Sylvester) Hadamard of a power-of-4 size."""
+    if size < 4 or (size & (size - 1)) != 0:
+        import math
+        if not math.log(size, 4).is_integer():
+            raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
+    h4 = torch.tensor(
+        [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+        dtype=dtype,
+        device=device,
+    )
+    h = h4
+    current_size = 4
+    while current_size < size:
+        h = torch.kron(h, h4)
+        current_size *= 4
+    return h / (size ** 0.5)
+
 def _valid_compute_dtype(dtype):
     return dtype in {torch.float16, torch.bfloat16, torch.float32, torch.float64}
 
@@ -381,25 +399,22 @@ def get_gguf_q8_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
     return GGUFQ8Ops
 
 
-# Q4_CR: custom W4A16 INT4 format backed by comfy_kitchen's AWQ GEMV.
-# Weights stay IN4-packded in VRAM (N, K//2 int8 + per-group fp scales/zeros)
-# and matmul dispatches to the native ck.gemv_awq_w4a16 tensor-core kernel.
-# The ops class mirrors RetiredGGUFQ4Ops: it owns its _load_from_state_dict
-# (ComfyUI's _load_quantized_module doesn't know int4_cr), builds the kitchen
-# QuantizedTensor lazily per-forward, and falls back to dequant on non-CUDA.
-def get_gguf_q4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
+# Q4_CR_W4A4: custom W4A4 INT4 format backed by comfy_kitchen's fast ConvRot
+# int4 tensor-core MMA. On-disk is kitchen-native packed int4 (N, K//2) int8
+# + a per-output-row fp16 scale. The weight is pre-rotated by a block-diagonal
+# Hadamard along K; at runtime the kernel rotates the activation into the same
+# basis, so output is directly in the original space.
+def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
     try:
-        from comfy_kitchen.tensor.awq_w4a16 import TensorCoreAWQW4A16Layout
+        from comfy_kitchen.tensor.convrot_w4a4 import TensorCoreConvRotW4A4Layout
         from comfy_kitchen.tensor.base import QuantizedTensor
-        import comfy_kitchen as ck
         _HAVE_KITCHEN = True
     except Exception:
-        TensorCoreAWQW4A16Layout = None
+        TensorCoreConvRotW4A4Layout = None
         QuantizedTensor = None
-        ck = None
         _HAVE_KITCHEN = False
 
-    class GGUFQ4Ops(comfy.ops.disable_weight_init):
+    class GGUFQ4W4A4Ops(comfy.ops.disable_weight_init):
         class Linear(torch.nn.Module, comfy.ops.CastWeightBiasOp):
             comfy_cast_weights = True
 
@@ -410,22 +425,22 @@ def get_gguf_q4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 self.weight = None
                 self.register_parameter("bias", None)
                 self._orig_shape = (out_features, in_features)
-                self._group_size = 64
+                self._convrot_groupsize = 256
+                self._quant_group_size = 64
                 self._quantized = False
-                self._orig_in_features = in_features
                 self.weight_scale = None
-                self.weight_zeros = None
+                self._compute_dtype = torch.bfloat16
+                self._quantized_weight = None
+                self._quantized_weight_device = None
 
             def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs):
                 weight_key = f"{prefix}weight"
                 scale_key = f"{prefix}weight_scale"
-                zeros_key = f"{prefix}weight_zeros"
                 quant_key = f"{prefix}comfy_quant"
 
                 weight = state_dict.pop(weight_key, None)
                 scale = state_dict.pop(scale_key, None)
-                zeros = state_dict.pop(zeros_key, None)
                 quant_raw = state_dict.pop(quant_key, None)
 
                 bias_key = f"{prefix}bias"
@@ -450,40 +465,62 @@ def get_gguf_q4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                     return
 
                 if scale is None:
-                    raise RuntimeError(f"Missing Q4_CR scale tensor for {prefix}")
+                    raise RuntimeError(f"Missing Q4_CR_W4A4 scale tensor for {prefix}")
 
                 quant_conf = json.loads(bytes(quant_raw.tolist()).decode("utf-8"))
-                if quant_conf.get("format") != "int4_cr":
-                    raise ValueError(f"Unsupported Q4_CR format for {prefix}: {quant_conf.get('format')!r}")
-                self._group_size = quant_conf.get("group_size", 64)
+                if quant_conf.get("format") != "int4_cr" or quant_conf.get("backing") != "w4a4":
+                    raise ValueError(
+                        f"Unsupported Q4_CR_W4A4 format for {prefix}: {quant_conf.get('format')!r} "
+                        f"/ {quant_conf.get('backing')!r}"
+                    )
+                self._convrot_groupsize = quant_conf.get("convrot_groupsize", 256)
+                self._quant_group_size = quant_conf.get("quant_group_size", 64)
                 self._orig_shape = tuple(quant_conf.get("orig_shape", (self.out_features, self.in_features)))
                 self.out_features = self._orig_shape[0]
                 self.in_features = self._orig_shape[1]
 
                 self.weight = torch.nn.Parameter(weight, requires_grad=False)
                 self.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
-                self.weight_zeros = torch.nn.Parameter(zeros, requires_grad=False) if zeros is not None else None
                 self._quantized = True
+                self._compute_dtype = quant_conf.get("orig_dtype", torch.bfloat16)
+                self._quantized_weight = None
+                self._quantized_weight_device = None
 
-            def _build_quantized_weight(self, device, dtype):
+            def _build_quantized_weight(self, device, dtype, packed=None):
                 if not _HAVE_KITCHEN:
                     return None
-                if self.weight_zeros is not None:
-                    zeros = self.weight_zeros.to(device=device, dtype=dtype)
+                if packed is None:
+                    packed = self.weight.to(device=device).to(torch.int8)
                 else:
-                    zeros = torch.zeros_like(self.weight_scale.to(device=device, dtype=dtype))
-                scale = self.weight_scale.to(device=device, dtype=dtype).contiguous()
-                zeros = zeros.contiguous()
-                packed = self.weight.to(device=device).to(torch.int8)
-                g = self._group_size
-                params = TensorCoreAWQW4A16Layout.Params(
+                    packed = packed.to(device=device).to(torch.int8)
+                scale = self.weight_scale.to(device=device, dtype=torch.float32).contiguous()
+                params = TensorCoreConvRotW4A4Layout.Params(
                     scale=scale,
-                    zeros=zeros,
                     orig_dtype=dtype,
                     orig_shape=self._orig_shape,
-                    group_size=g,
+                    convrot_groupsize=self._convrot_groupsize,
+                    quant_group_size=self._quant_group_size,
+                    linear_dtype="int4",
                 )
-                return QuantizedTensor(packed, "TensorCoreAWQW4A16Layout", params)
+                return QuantizedTensor(packed, "TensorCoreConvRotW4A4Layout", params)
+
+            def _get_cached_quantized_weight(self, device, packed=None):
+                if packed is not None:
+                    # A patched/offloaded packed weight may differ from self.weight
+                    # (e.g. moved to device each forward). Build fresh; don't cache,
+                    # because the packed content can change per forward.
+                    return self._build_quantized_weight(device, self._compute_dtype, packed=packed)
+                if self._quantized_weight is not None and self._quantized_weight_device == str(device):
+                    return self._quantized_weight
+                if self._quantized_weight is not None:
+                    self._quantized_weight = None
+                    if hasattr(self, "_quantized_weight_scale") and self._quantized_weight_scale is not None:
+                        # Free the previous device's cached scale/params to avoid a leak.
+                        self._quantized_weight_scale = None
+                qt = self._build_quantized_weight(device, self._compute_dtype)
+                self._quantized_weight = qt
+                self._quantized_weight_device = str(device)
+                return qt
 
             def forward_comfy_cast_weights(self, input, *args, **kwargs):
                 bias = self.bias.to(device=input.device, dtype=input.dtype) if self.bias is not None else None
@@ -492,11 +529,49 @@ def get_gguf_q4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                     weight = self.weight.to(device=input.device, dtype=input.dtype)
                     return torch.nn.functional.linear(input, weight, bias)
                 if self.weight_function or self.bias_function:
-                    # LoRA/patch path: dequantize and fall back to a full-precision matmul.
+                    # DynamicVRAM offload registers a weight_lowvram_function that is a
+                    # pure move-to-device, and it is promoted into weight_function. The
+                    # weight itself lives on the offload (CPU) device after staging, so
+                    # applying the function to `self.weight` would trigger a SYNCHRONOUS
+                    # CPU->GPU transfer of all packed weights on EVERY forward (measured
+                    # ~750 ms for the full model) -- that transfer is then discarded and
+                    # the cache rebuilt from CPU again. That is the dominant DynamicVRAM
+                    # cost for this path.
+                    #
+                    # Instead: first (re)build/reuse the device-resident cached
+                    # QuantizedTensor (moves weight+scale to the input device once per
+                    # device), then apply weight_function to the DEVICE-resident packed
+                    # qdata. A pure offload/relocate is a no-op on a tensor that is
+                    # already on the input device (returns the same int8, no transfer),
+                    # so the native kernel still runs. A genuine value-changing patch
+                    # computes on the dequantized weight and yields non-int8, which forces
+                    # the dequant fallback below. This keeps correctness for real LoRA/
+                    # patches while eliminating the per-forward transfer.
+                    weight_qt = self._get_cached_quantized_weight(input.device)
+                    if weight_qt is not None:
+                        qdata = weight_qt._qdata
+                        patched = qdata
+                        try:
+                            for f in self.weight_function:
+                                patched = f(patched)
+                        except Exception:
+                            patched = None
+                        if (
+                            isinstance(patched, torch.Tensor)
+                            and patched.dtype == torch.int8
+                            and patched.shape == qdata.shape
+                            and patched.device == input.device
+                        ):
+                            out = torch.nn.functional.linear(input, weight_qt)
+                            if bias is not None:
+                                out = out + bias
+                            return out
+                    # Real patch changed values beyond the packed int8 (or no kitchen):
+                    # dequantize and fall back to a full-precision matmul.
                     _orig_w = self._dequantized_weight(input.device, input.dtype)
                     return torch.nn.functional.linear(input, _orig_w, bias)
 
-                weight_qt = self._build_quantized_weight(input.device, input.dtype)
+                weight_qt = self._get_cached_quantized_weight(input.device)
                 if weight_qt is None:
                     # No comfy_kitchen / non-CUDA: dequant fallback.
                     _orig_w = self._dequantized_weight(input.device, input.dtype)
@@ -508,10 +583,6 @@ def get_gguf_q4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 return out
 
             def forward(self, *args, **kwargs):
-                # ComfyUI's disable_weight_init.Linear provides 'forward', but this
-                # class subclasses (torch.nn.Module, CastWeightBiasOp) directly, so
-                # 'forward' is not inherited. Route through forward_comfy_cast_weights
-                # (matching the Q8/serial dispatch) so the native INT4 kernel is used.
                 comfy.ops.run_every_op()
                 if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
                     return self.forward_comfy_cast_weights(*args, **kwargs)
@@ -524,25 +595,28 @@ def get_gguf_q4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
             def _dequantized_weight(self, device, dtype):
                 packed = self.weight.to(device=device).to(torch.int8)
                 scale = self.weight_scale.to(device=device, dtype=dtype)
-                zeros = (self.weight_zeros if self.weight_zeros is not None
-                         else torch.zeros_like(scale)).to(device=device, dtype=dtype)
                 n, k_half = packed.shape
                 k = k_half * 2
-                g = self._group_size
                 x32 = packed.to(torch.int32)
                 lo = (x32 & 0xF).to(torch.int8)
                 hi = ((x32 >> 4) & 0xF).to(torch.int8)
-                nibbles = torch.stack([lo, hi], dim=-1).reshape(n, k).to(dtype)
-                w = (
-                    (nibbles.view(n, k // g, g) - 8.0) * scale.t().unsqueeze(-1)
-                    + zeros.t().unsqueeze(-1)
-                ).view(n, k)
-                return w
+                nibbles = torch.stack([lo, hi], dim=-1).reshape(n, k).to(torch.float32)
+                # Signed two's-complement int4 -> [-8, 7], scaled per output row.
+                nibbles = torch.where(nibbles >= 8, nibbles - 16, nibbles)
+                w_rot = nibbles * scale.to(torch.float32).reshape(-1, 1)
+                # The weight was pre-rotated by a block-diagonal Hadamard along K;
+                # un-rotate so this dequant matches the kernel's effective weight.
+                cg = self._convrot_groupsize
+                if k % cg == 0:
+                    h = _build_regular_hadamard(cg, dtype=torch.float32, device=device)
+                    n_groups = k // cg
+                    w_rot = (w_rot.reshape(n, n_groups, cg) @ h).reshape(n, k)
+                return w_rot.to(dtype)
 
         def reset_parameters(self):
             return None
 
-    return GGUFQ4Ops
+    return GGUFQ4W4A4Ops
 
 
 # Retired experimental Q4_PT implementation. No loader or node runtime path

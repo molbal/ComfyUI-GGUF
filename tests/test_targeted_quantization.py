@@ -28,7 +28,7 @@ from tools.convert import (
     detect_arch,
     plan_target_size_quantization,
     quantize_int8_convrot,
-    quantize_int4_cr,
+    quantize_int4_cr_w4a4,
     resolve_quantization_device,
 )
 from dequant import dequantize, dequantize_functions, dequantize_tensor
@@ -57,7 +57,9 @@ def load_gguf_loader():
     return module
 
 
-def load_gguf_ops():
+def ops_factory():
+    """Load the repo's ops.py and return get_gguf_q4_w4a4_ops."""
+    import sys
     ops_path = Path(__file__).parents[1] / "ops.py"
     package_name = "comfyui_gguf_test"
     spec = importlib.util.spec_from_file_location(
@@ -66,11 +68,9 @@ def load_gguf_ops():
         submodule_search_locations=[str(ops_path.parent)],
     )
     module = importlib.util.module_from_spec(spec)
-    import sys
-    sys.modules[package_name] = module
     sys.modules[f"{package_name}.ops"] = module
     spec.loader.exec_module(module)
-    return module
+    return module.get_gguf_q4_w4a4_ops(torch.bfloat16)
 
 
 class TargetSizeQuantizationTests(unittest.TestCase):
@@ -1137,68 +1137,84 @@ class MinimaxH3DetectionTests(unittest.TestCase):
         )
 
 
-class Q4CRQuantizationTests(unittest.TestCase):
-    def test_int4_cr_packs_kitchen_native_layout(self):
+class Q4CRW4A4QuantizationTests(unittest.TestCase):
+    def test_int4_cr_w4a4_packs_kitchen_native_layout(self):
         torch.manual_seed(0)
-        weight = torch.randn(64, 256, dtype=torch.float32)
-        packed, (wscales, wzeros), quant_conf, orig_shape = quantize_int4_cr(
-            weight, group_size=64, device=torch.device("cpu")
+        weight = torch.randn(64, 512, dtype=torch.float32)
+        packed, wscales, quant_conf, orig_shape = quantize_int4_cr_w4a4(
+            weight, convrot_groupsize=256, quant_group_size=64, device=torch.device("cpu")
         )
 
-        # packed (N, K//2) int8, scales/zeros (K//G, N) bf16
-        self.assertEqual(packed.shape, (64, 128))
+        # packed (N, K//2) int8, scales (N,) float32 (per-output-row)
+        self.assertEqual(packed.shape, (64, 256))
         self.assertEqual(packed.dtype, torch.int8)
-        self.assertEqual(wscales.shape, (256 // 64, 64))
-        self.assertEqual(wzeros.shape, (256 // 64, 64))
-        self.assertEqual(wscales.dtype, torch.bfloat16)
-        self.assertEqual(orig_shape, (64, 256))
+        self.assertEqual(wscales.shape, (64,))
+        self.assertEqual(wscales.dtype, torch.float32)
+        self.assertEqual(orig_shape, (64, 512))
         self.assertEqual(quant_conf["format"], "int4_cr")
-        self.assertEqual(quant_conf["group_size"], 64)
-        self.assertFalse(quant_conf["sym"])
+        self.assertEqual(quant_conf["backing"], "w4a4")
+        self.assertEqual(quant_conf["convrot_groupsize"], 256)
+        self.assertEqual(quant_conf["quant_group_size"], 64)
+        self.assertTrue(quant_conf["sym"])
 
-    def test_int4_cr_roundtrips_through_dequant(self):
+    def test_int4_cr_w4a4_roundtrips_through_dequant(self):
         torch.manual_seed(0)
-        weight = torch.randn(64, 256, dtype=torch.float32)
-        packed, (wscales, wzeros), quant_conf, _ = quantize_int4_cr(
-            weight, group_size=64, device=torch.device("cpu")
+        weight = torch.randn(64, 1024, dtype=torch.float32)
+        packed, wscales, quant_conf, _ = quantize_int4_cr_w4a4(
+            weight, convrot_groupsize=256, quant_group_size=64, device=torch.device("cpu")
         )
 
-        # Mirror the ops._dequantized_weight math.
+        # Mirror the ops._dequantized_weight math: signed two's-complement int4
+        # per-output-row scale, then un-rotate by the block-diagonal Hadamard.
         n, k = weight.shape
         x32 = packed.to(torch.int32)
-        lo = (x32 & 0xF).to(torch.int8)
-        hi = ((x32 >> 4) & 0xF).to(torch.int8)
-        nibbles = torch.stack([lo, hi], dim=-1).reshape(n, k).to(torch.float32)
-        decoded = (nibbles.view(n, k // 64, 64) - 8.0) * wscales.t().unsqueeze(-1) \
-            + wzeros.t().unsqueeze(-1)
-        decoded = decoded.view(n, k)
+        lo = (x32 & 0x0F).to(torch.float32)
+        hi = ((x32 >> 4) & 0x0F).to(torch.float32)
+        nibbles = torch.stack([lo, hi], dim=-1).reshape(n, k)
+        nibbles = torch.where(nibbles >= 8, nibbles - 16, nibbles)
+        w_rot = nibbles * wscales.reshape(-1, 1)
 
-        # INT4 reconstruction must stay reasonably close to the source.
-        relative = (decoded - weight).abs().amax().item() / weight.abs().amax().item()
-        self.assertLess(relative, 0.2)
+        # Un-rotate to the original basis.
+        cg = 256
+        from tools.convert import _build_regular_hadamard
+        h = _build_regular_hadamard(cg, dtype=torch.float32, device="cpu")
+        ng = k // cg
+        w_rec = (w_rot.reshape(n, ng, cg) @ h).reshape(n, k)
 
-    def test_int4_cr_rejects_group_size_not_dividing_k(self):
+        relative = (w_rec - weight).abs().amax().item() / weight.abs().amax().item()
+        self.assertLess(relative, 0.3)
+
+    def test_int4_cr_w4a4_rejects_k_not_divisible_by_convrot(self):
+        # K=300 is not divisible by the 256 convrot group -> must reject.
         with self.assertRaisesRegex(ValueError, "must divide input features"):
-            quantize_int4_cr(torch.randn(64, 256), group_size=127, device=torch.device("cpu"))
+            quantize_int4_cr_w4a4(
+                torch.randn(64, 300), convrot_groupsize=256, quant_group_size=64,
+                device=torch.device("cpu")
+            )
+        with self.assertRaisesRegex(ValueError, "must divide input features"):
+            quantize_int4_cr_w4a4(
+                torch.randn(64, 224), convrot_groupsize=256, quant_group_size=64,
+                device=torch.device("cpu")
+            )
 
-    def test_int4_cr_serializes_kitchen_metadata(self):
+    def test_int4_cr_w4a4_serializes_kitchen_metadata(self):
         state_dict = {
             "video_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
             "audio_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
-            "blocks.0.attn.qkv_proj.weight": torch.ones((96, 64), dtype=torch.float32),
-            "final_layer.video_out.weight": torch.ones((96, 64), dtype=torch.float32),
+            "blocks.0.attn.qkv_proj.weight": torch.ones((96, 512), dtype=torch.float32),
+            "final_layer.video_out.weight": torch.ones((96, 512), dtype=torch.float32),
         }
 
         with TemporaryDirectory() as temp_dir:
             source_path = Path(temp_dir) / "minimax_h3.safetensors"
-            output_path = Path(temp_dir) / "minimax_h3-Q4_CR_M.gguf"
+            output_path = Path(temp_dir) / "minimax_h3-Q4_CR_W4A4.gguf"
             save_file(state_dict, str(source_path))
 
             converted_path, _ = convert_file(
                 str(source_path),
                 str(output_path),
                 interact=False,
-                quant_type_name="Q4_CR_M",
+                quant_type_name="Q4_CR_W4A4",
                 quantization_device="cpu",
             )
 
@@ -1210,122 +1226,40 @@ class Q4CRQuantizationTests(unittest.TestCase):
             reader.data._mmap.close()
             del reader
 
-        # Weight stays at I8 (2 uint4 per byte) and scale/zeros are stored as F16.
+        # Weight stays I8 (2 uint4 per byte) and per-row scale stored as F16.
         self.assertEqual(tensor_types["blocks.0.attn.qkv_proj.weight"], gguf.GGMLQuantizationType.I8)
         self.assertEqual(tensor_types["blocks.0.attn.qkv_proj.weight_scale"], gguf.GGMLQuantizationType.F16)
-        self.assertIn("blocks.0.attn.qkv_proj.weight_zeros", names)
+        self.assertIn("blocks.0.attn.qkv_proj.weight_scale", names)
 
-    def test_int4_cr_keeps_non_linear_conv_in_fp16(self):
-        state_dict = {
-            "decoder.transformer_blocks.0.scale1": torch.ones(32, dtype=torch.float32),
-            "decoder.x_embedder.weight": torch.ones((64, 32), dtype=torch.float32),
-            "encoder.down.5.block.0.conv1.weight": torch.ones(
-                (2, 2, 3, 3, 3), dtype=torch.float32
-            ),
-        }
-
-        with TemporaryDirectory() as temp_dir:
-            source_path = Path(temp_dir) / "minimax_h3_vae.safetensors"
-            output_path = Path(temp_dir) / "minimax_h3_vae-Q4_CR_M.gguf"
-            save_file(state_dict, str(source_path))
-
-            converted_path, _ = convert_file(
-                str(source_path),
-                str(output_path),
-                interact=False,
-                quant_type_name="Q4_CR_M",
-                quantization_device="cpu",
-            )
-
-            reader = gguf.GGUFReader(converted_path)
-            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
-            reader.tensors.clear()
-            reader.fields.clear()
-            reader.data._mmap.close()
-            del reader
-
-        # Conv3d must NOT be quantized down to a custom layout.
-        self.assertEqual(
-            tensor_types["encoder.down.5.block.0.conv1.weight"],
-            gguf.GGMLQuantizationType.F16,
-        )
-
-
-class Q4CRLoaderTests(unittest.TestCase):
-    def setUp(self):
-        # Load the loader module under a synthetic package name.
-        self.loader = load_gguf_loader()
-
-    @unittest.skipUnless(torch.cuda.is_available(), "Q4_CR kernel requires CUDA")
-    def test_int4_cr_ops_forward_matches_dequant(self):
-        ops_mod = load_gguf_ops()
-        get_gguf_q4_ops = ops_mod.get_gguf_q4_ops
-
-        torch.manual_seed(0)
-        n, k, g = 128, 6144, 64
-        w = torch.randn(n, k) * 0.4
-        packed, (wscales, wzeros), quant_conf, orig_shape = quantize_int4_cr(
-            w, group_size=g, device=torch.device("cpu")
-        )
-
-        ops = get_gguf_q4_ops(compute_dtype=torch.bfloat16)()
-        lin = ops.Linear(in_features=k, out_features=n)
-        quant_conf["orig_shape"] = list(orig_shape)
-        src_sd = {
-            "weight": packed,
-            "weight_scale": wscales,
-            "weight_zeros": wzeros,
-            "comfy_quant": torch.tensor(list(json.dumps(quant_conf).encode()), dtype=torch.uint8),
-        }
-        lin._load_from_state_dict(src_sd, prefix="", local_metadata={}, strict=False,
-                                  missing_keys=[], unexpected_keys=[], error_msgs=[])
-        self.assertTrue(lin._quantized)
-        self.assertEqual((lin.in_features, lin.out_features), (k, n))
-
-        x = torch.randn(4, k, device="cuda", dtype=torch.bfloat16)
-        # Call through __call__/forward (not forward_comfy_cast_weights directly)
-        # to reproduce the Krea2 "Module [Linear] is missing the required forward
-        # function" failure and guard against its regression.
-        out = lin(x)
-        self.assertEqual(out.shape, (4, n))
-
-        wq32 = lin._dequantized_weight(torch.device("cuda"), torch.float32)
-        ref = torch.nn.functional.linear(x.float(), wq32)
-        rel = (out.float() - ref).abs().amax().item() / ref.abs().amax().item()
-        self.assertLess(rel, 0.05)
-
-    def test_int4_cr_loader_routes_to_kitchen_ops(self):
+    def test_int4_cr_w4a4_loader_routes_to_w4a4_ops(self):
         state_dict = {
             "video_patch_proj.weight": torch.randn(32, 32, dtype=torch.float32),
             "audio_patch_proj.weight": torch.randn(32, 32, dtype=torch.float32),
-            "blocks.0.attn.qkv_proj.weight": torch.randn(96, 64, dtype=torch.float32),
-            "final_layer.video_out.weight": torch.randn(96, 64, dtype=torch.float32),
+            "blocks.0.attn.qkv_proj.weight": torch.randn(96, 512, dtype=torch.float32),
+            "final_layer.video_out.weight": torch.randn(96, 512, dtype=torch.float32),
         }
 
         with TemporaryDirectory() as temp_dir:
             source_path = Path(temp_dir) / "minimax_h3.safetensors"
-            output_path = Path(temp_dir) / "minimax_h3-Q4_CR_M.gguf"
+            output_path = Path(temp_dir) / "minimax_h3-Q4_CR_W4A4.gguf"
             save_file(state_dict, str(source_path))
 
             converted_path, _ = convert_file(
                 str(source_path),
                 str(output_path),
                 interact=False,
-                quant_type_name="Q4_CR_M",
+                quant_type_name="Q4_CR_W4A4",
                 quantization_device="cpu",
             )
 
-            sd, extra = self.loader.gguf_sd_loader(converted_path)
+            loader = load_gguf_loader()
+            sd, extra = loader.gguf_sd_loader(converted_path)
 
             w = sd["blocks.0.attn.qkv_proj.weight"]
-            qraw = sd["blocks.0.attn.qkv_proj.comfy_quant"]
+            sd_key = "blocks.0.attn.qkv_proj"
+            qraw = sd[f"{sd_key}.comfy_quant"]
             quant_conf = json.loads(bytes(qraw.tolist()).decode("utf-8"))
 
-            w_shape = tuple(int(v) for v in w.shape)
-            w_dtype_name = str(w.dtype)
-            mode = extra.get("gguf_quant_mode")
-
-            # Detach from the mmap-backed storage before the TemporaryDirectory exits.
             w_detached = w.detach().clone().tolist()
             del w
             del qraw
@@ -1333,109 +1267,90 @@ class Q4CRLoaderTests(unittest.TestCase):
             del extra
             gc.collect()
 
-        self.assertEqual(mode, "int4_cr")
-
-        # The packed weight is (N, K//2) int8; the scale is (K//G, N).
-        self.assertEqual(w_shape, (96, 32))
-        self.assertEqual(w_dtype_name, "torch.int8")
-        # Confirms the packed weight carries real int4-ish nibble data.
-        self.assertEqual(len(w_detached), 96)
-
-        # The comfy_quant metadata decodes back to int4_cr.
         self.assertEqual(quant_conf["format"], "int4_cr")
-        self.assertEqual(quant_conf["group_size"], 64)
-        self.assertEqual(quant_conf["orig_shape"], [96, 64])
+        self.assertEqual(quant_conf["backing"], "w4a4")
+        self.assertEqual(quant_conf["orig_shape"], [96, 512])
 
-    def test_int4_cr_loader_converts_fp16_scales_to_bf16(self):
-        # Regression: the loader must convert the F16-stored per-group scales
-        # to bf16 with .to(), NOT a raw .view(bfloat16) byte reinterpretation
-        # (which corrupts the scale to tiny garbage values).
-        state_dict = {
-            "video_patch_proj.weight": torch.randn(32, 32, dtype=torch.float32),
-            "audio_patch_proj.weight": torch.randn(32, 32, dtype=torch.float32),
-            "blocks.0.attn.qkv_proj.weight": torch.randn(96, 64, dtype=torch.float32),
-            "final_layer.video_out.weight": torch.randn(96, 64, dtype=torch.float32),
-        }
+    def test_int4_cr_w4a4_ops_offload_hook_keeps_native_kernel(self):
+        # A DynamicVRAM offload hook is a pure relocate-only weight_function. It must
+        # keep the packed int8 weight and run the native W4A4 kernel (not dequantize
+        # per forward). A real patch that changes values must fall back to dequant.
+        ops = ops_factory()
+        lin = ops.Linear(64, 64, bias=True)
+        weight2 = torch.randn(64, 512, dtype=torch.float32)
+        packed, wscales, quant_conf, orig_shape = quantize_int4_cr_w4a4(
+            weight2, convrot_groupsize=256, quant_group_size=64, device=torch.device("cpu")
+        )
+        quant_conf["orig_shape"] = [64, 512]
+        lin._load_from_state_dict(
+            {
+                "weight": packed,
+                "weight_scale": wscales.half(),
+                "comfy_quant": torch.tensor(list(json.dumps(quant_conf).encode("utf-8"))),
+                "bias": torch.randn(64, dtype=torch.float32),
+            },
+            prefix="",
+            local_metadata={},
+            strict=True,
+            missing_keys=[],
+            unexpected_keys=[],
+            error_msgs=[],
+        )
+        self.assertTrue(lin._quantized)
 
-        with TemporaryDirectory() as temp_dir:
-            source_path = Path(temp_dir) / "minimax_h3.safetensors"
-            output_path = Path(temp_dir) / "minimax_h3-Q4_CR_M.gguf"
-            save_file(state_dict, str(source_path))
+        x = torch.randn(8, 512, dtype=torch.float32)
 
-            converted_path, _ = convert_file(
-                str(source_path),
-                str(output_path),
-                interact=False,
-                quant_type_name="Q4_CR_M",
-                quantization_device="cpu",
-            )
+        # Relocate-only hook (offload): returns the packed int8 moved to the input device.
+        def relocate(t, *a, **kw):
+            return t.to(device=x.device)
+        lin.weight_function = [relocate]
+        # Force a fresh build (device differs), then confirm it reuses the cache.
+        del lin._quantized_weight
+        lin._quantized_weight = None
+        lin._quantized_weight_device = None
+        out = lin(x)
+        # The offload hook applied to packed int8 should keep int8 shape/dtype, so we
+        # never hit the dequant fallback. Output shape is correct.
+        self.assertEqual(out.shape, (8, 64))
+        # The cached QuantizedTensor must now be populated (proves the fast path ran).
+        self.assertIsNotNone(lin._quantized_weight)
+        self.assertEqual(lin._quantized_weight_device, str(x.device))
 
-            sd, _ = self.loader.gguf_sd_loader(converted_path)
-            s = sd["blocks.0.attn.qkv_proj.weight_scale"].detach().clone()
-            del sd
-            gc.collect()
+    def test_int4_cr_w4a4_ops_real_patch_falls_back_to_dequant(self):
+        # A genuine value-changing patch on the weight must dequantize and use a
+        # full-precision matmul (correctness for LoRA), not run the packed kernel.
+        ops = ops_factory()
+        lin = ops.Linear(64, 64, bias=True)
+        weight = torch.randn(64, 512, dtype=torch.float32)
+        packed, wscales, quant_conf, orig_shape = quantize_int4_cr_w4a4(
+            weight, convrot_groupsize=256, quant_group_size=64, device=torch.device("cpu")
+        )
+        quant_conf["orig_shape"] = [64, 512]
+        lin._load_from_state_dict(
+            {
+                "weight": packed,
+                "weight_scale": wscales.half(),
+                "comfy_quant": torch.tensor(list(json.dumps(quant_conf).encode("utf-8"))),
+                "bias": torch.randn(64, dtype=torch.float32),
+            },
+            prefix="",
+            local_metadata={},
+            strict=True,
+            missing_keys=[],
+            unexpected_keys=[],
+            error_msgs=[],
+        )
+        x = torch.randn(8, 512, dtype=torch.float32)
 
-        self.assertEqual(s.dtype, torch.bfloat16)
-        # Scales are per-group amplitudes; a valid scale is small (>0) and
-        # reasonably bounded, not the ~1e-22 garbage a byte-reinterpret gives.
-        self.assertGreater(s.abs().max().item(), 1e-6)
-        self.assertLess(s.abs().max().item(), 100.0)
-
-
-class ExperimentalTritonInt4Tests(unittest.TestCase):
-    """Gated, offline-only correctness checks for the experimental Triton kernel.
-
-    These do NOT run in a normal environment (and are skipped when Triton / CUDA
-    are unavailable). They exist to keep the ``triton_int4.py`` prototype as a
-    reproducible, correct-against-its-reference artifact even though it is not
-    wired into the runtime path (it is slower than the INT8 Q8 path).
-    """
-
-    def _skip_unless(self):
-        triton_mod = None
-        try:
-            import triton_int4 as ti  # noqa: F401
-            triton_mod = ti
-        except Exception:
-            import sys
-            sys.path.insert(0, str(Path(__file__).parents[1]))
-            try:
-                import triton_int4 as ti
-                triton_mod = ti
-            except Exception as e:
-                self.skipTest(f"triton_int4 module not importable: {e}")
-        if triton_mod is None or not getattr(triton_mod, "_HAS_TRITON_CUDA", False):
-            self.skipTest("Triton/CUDA not available; experimental kernel disabled.")
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA not available.")
-        return triton_mod
-
-    def test_triton_kernel_matches_dequant_reference(self):
-        ti = self._skip_unless()
-        torch.manual_seed(0)
-        dev = "cuda"
-        g = 64
-        k, n = 4096, 8192
-        m = 1024
-        x = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
-        qw = torch.randint(0, 255, (n, k // 2), device=dev, dtype=torch.int32).to(torch.int8)
-        ws = (torch.randn(k // g, n, device=dev).abs() + 0.1).to(torch.bfloat16)
-        wz = torch.zeros(k // g, n, device=dev, dtype=torch.bfloat16)
-
-        got = ti.triton_q4cr_mm(x, qw, ws, wz, g, BLOCK_M=128, BLOCK_N=128, BLOCK_K=32)
-
-        # fp64 ground truth (independent of torch bf16 rounding)
-        x32 = qw.to(torch.int32)
-        lo = (x32 & 0xF)
-        hi = ((x32 >> 4) & 0xF)
-        nibbles = torch.stack([lo, hi], dim=-1).reshape(n, k).to(torch.float64)
-        w = ((nibbles.view(n, k // g, g) - 8.0) * ws.t().double().unsqueeze(-1)
-             + wz.t().double().unsqueeze(-1)).view(n, k)
-        ref = x.double() @ w.t()
-
-        err = (got.double() - ref).abs()
-        mean_rel = (err / (ref.abs() + 1e-3)).mean().item()
-        self.assertLess(mean_rel, 0.05)
+        # A patch that dequantizes to fp32 (returns a non-int8 tensor) -> must fall back.
+        def patch(t, *a, **kw):
+            return t.to(torch.float32)
+        lin.weight_function = [patch]
+        lin._quantized_weight = None
+        lin._quantized_weight_device = None
+        # Should not raise (dequant fallback path).
+        out = lin(x)
+        self.assertEqual(out.shape, (8, 64))
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ import comfy.model_management
 import comfy.memory_management
 import folder_paths
 
-from .ops import GGMLTensor, GGMLOps, get_gguf_q8_ops, get_gguf_q4_ops, move_patch_to_device
+from .ops import GGMLTensor, GGMLOps, get_gguf_q8_ops, get_gguf_q4_w4a4_ops, move_patch_to_device
 from .loader import gguf_sd_loader, gguf_clip_loader, gguf_tensor_count
 from .dequant import dequantize_tensor, is_quantized, is_torch_compatible
 from .tools.convert import (
@@ -211,9 +211,10 @@ class UnetLoaderGGUF:
                 "Q4_PT is retired because PyTorch's Ampere INT4 kernel is not "
                 "performance-competitive. Reconvert the model as Q8_CR."
             )
-        elif mode == "int4_cr":
-            # Q4_CR: custom W4A16 INT4 backed by comfy_kitchen's AWQ GEMV.
-            ops = get_gguf_q4_ops(compute_dtype=torch.bfloat16)()
+        elif mode == "int4_cr_w4a4":
+            # Q4_CR_W4A4: custom W4A4 INT4 backed by comfy_kitchen's fast
+            # ConvRot int4 tensor-core MMA.
+            ops = get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16)()
         else:
             ops = GGMLOps()
 
@@ -668,8 +669,8 @@ def _legacy_gguf_ops(extra):
             "Q4_PT is retired because PyTorch's Ampere INT4 kernel is not "
             "performance-competitive. Reconvert the model as Q8_CR."
         )
-    if mode == "int4_cr":
-        return get_gguf_q4_ops(compute_dtype=torch.bfloat16)()
+    if mode == "int4_cr_w4a4":
+        return get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16)()
     return GGMLOps()
 
 

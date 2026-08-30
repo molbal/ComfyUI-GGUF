@@ -1,5 +1,6 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 import os
+import math
 import gguf
 import json
 import torch
@@ -412,9 +413,10 @@ QUANT_TYPE_MAP = {
     "Q4_1": (gguf.GGMLQuantizationType.Q4_1, gguf.LlamaFileType.MOSTLY_Q4_1),
     "Q4_0": (gguf.GGMLQuantizationType.Q4_0, gguf.LlamaFileType.MOSTLY_Q4_0),
     "Q8_CR": (gguf.GGMLQuantizationType.I8, None),  # INT8 ConvRot (ComfyUI native)
-    # Q4_CR is a custom W4A16 INT4 format backed by comfy_kitchen's AWQ GEMV.
-    # Stored as kitchen-native packed uint4 (N, K//2) + per-group fp scales/zeros.
-    "Q4_CR_M": (gguf.GGMLQuantizationType.I8, None),
+    # Q4_CR_W4A4 is a custom W4A4 INT4 format backed by comfy_kitchen's fast
+    # ConvRot int4 tensor-core MMA. Stored as kitchen-native packed int4 (N, K//2)
+    # + per-output-row fp scales (no per-group scales/zeros).
+    "Q4_CR_W4A4": (gguf.GGMLQuantizationType.I8, None),
     # Q4_PT is retired pending a performant Ampere W4A16 backend.
     # "Q4_PT": (gguf.GGMLQuantizationType.I8, None),
 }
@@ -422,7 +424,8 @@ QUANT_TYPE_MAP = {
 TARGET_SIZE_QUANT_TYPE = "TARGET_SIZE"
 TARGET_SIZE_Q8_TYPES = ("Q8_CR", "Q8_0")
 DEFAULT_TARGET_SIZE_Q8_TYPE = "Q8_CR"
-Q4_CR_GROUP_SIZE = 64  # Medium (M) granularity. S/L variants use 32/128.
+Q4_CR_W4A4_CONVROT_GROUP_SIZE = 256
+Q4_CR_W4A4_QUANT_GROUP_SIZE = 64
 QUANTIZATION_DEVICE_OPTIONS = ("auto", "cpu", "cuda")
 MEBIBYTE = 1024 * 1024
 
@@ -633,55 +636,86 @@ def quantize_int8_convrot(weight, convrot_groupsize=256, device=None):
     return qdata, scale, quant_conf, orig_shape
 
 
-def quantize_int4_cr(weight, group_size=64, device=None, dtype=torch.bfloat16):
+def quantize_int4_cr_w4a4(
+    weight,
+    convrot_groupsize=256,
+    quant_group_size=64,
+    device=None,
+    dtype=torch.bfloat16,
+):
     """
-    Quantize a 2D Linear weight to kitchen-native AWQ W4A16 (Q4_CR).
+    Quantize a 2D Linear weight to the ConvRot W4A4 path (Q4_CR_W4A4, backed by
+    comfy_kitchen's fast int4 tensor-core MMA).
 
-    Storage matches comfy_kitchen's TensorCoreAWQW4A16Layout contract so the
+    Storage matches comfy_kitchen's TensorCoreConvRotW4A4Layout contract so the
     loader can rebuild a QuantizedTensor without re-packing:
-      qweight:  (N, K//2) int8        two uint4 per byte, row-major
-                                        bits 0..3 -> column 2j
-                                        bits 4..7 -> column 2j+1
-      wscales:  (K//G, N) bf16/fp16   per-group fp scales
-      wzeros:   (K//G, N) bf16/fp16   per-group fp zero points (asymmetric)
+      qweight:  (N, K//2) int8        two signed int4 per byte, row-major
+                                        bits 0..3 -> column 2j   (low nibble)
+                                        bits 4..7 -> column 2j+1 (high nibble)
+      wscales:  (N,) float32          per-output-row symmetric scale
 
-    Dequant: W[n,k] = (u4[n,k] - 8) * wscales[k//G,n] + wzeros[k//G,n]
+    The weight is rotated by a block-diagonal regular Hadamard (group
+    ``convrot_groupsize``) along K before quantization, matching the ConvRot
+    activation rotation the kernel applies at runtime. Dequant (after the
+    runtime rotates the activation back) is symmetric about zero: 7-bit signed
+    emission range [-7, 7] with scale = absmax / 7.
     """
     if device is not None:
         weight = weight.to(device)
+    if quant_group_size != 64:
+        raise ValueError("Q4_CR W4A4 requires quant_group_size 64 (int4 MMA kernel contract).")
     weight = weight.to(torch.float32)
     orig_shape = tuple(weight.shape)
     n, k = orig_shape
 
-    if k % group_size != 0:
+    if k % convrot_groupsize != 0:
         raise ValueError(
-            f"Q4_CR group size {group_size} must divide input features {k} "
-            f"for tensor {orig_shape}."
+            f"Q4_CR W4A4 convrot group size {convrot_groupsize} must divide input "
+            f"features {k} for tensor {orig_shape}."
         )
 
-    w_grouped = weight.reshape(n, k // group_size, group_size)
-    w_min = w_grouped.amin(dim=-1, keepdim=True)
-    w_max = w_grouped.amax(dim=-1, keepdim=True)
-    scale = (w_max - w_min) / 15.0
-    scale = scale.clamp_min(1e-9)
-    zero = w_min + (8.0 * scale)  # zero point centered so (q - 8) * scale + zero = w
-    q = ((w_grouped - w_min) / scale).round().clamp(0, 15).to(torch.uint8)
+    h = _build_regular_hadamard(convrot_groupsize, dtype=torch.float32, device=weight.device)
+    n_groups = k // convrot_groupsize
+    weight_grouped = weight.reshape(n, n_groups, convrot_groupsize)
+    weight_rotated = torch.matmul(weight_grouped, h.T).reshape(n, k).float()
 
-    q_flat = q.reshape(n, k)
-    # Kitchen-native packing: even column 2j in the LOW nibble, odd column 2j+1
-    # in the HIGH nibble. Stored as int8 so the CUDA backend accepts it.
-    packed = (q_flat[:, 0::2] | (q_flat[:, 1::2] << 4)).to(torch.int8)
+    absmax = weight_rotated.abs().amax(dim=1, keepdim=True).clamp_min(1e-10)
+    scales = absmax / 7.0
+    q = (weight_rotated / scales).round().clamp(-7, 7).to(torch.int8)
 
-    wscales = scale.reshape(n, k // group_size).t().to(dtype)
-    wzeros = zero.reshape(n, k // group_size).t().to(dtype)
+    q_flat = q.to(torch.int32)
+    lo = q_flat[:, 0::2] & 0x0F
+    hi = q_flat[:, 1::2] & 0x0F
+    packed = (lo | (hi << 4)).to(torch.int8)
+
+    wscales = scales.reshape(n).to(torch.float32)
 
     quant_conf = {
         "format": "int4_cr",
-        "group_size": group_size,
+        "backing": "w4a4",
+        "convrot_groupsize": convrot_groupsize,
+        "quant_group_size": quant_group_size,
         "orig_shape": orig_shape,
-        "sym": False,
+        "sym": True,
     }
-    return packed, (wscales, wzeros), quant_conf, orig_shape
+    return packed, wscales, quant_conf, orig_shape
+
+
+def _build_regular_hadamard(size, dtype=torch.float32, device="cpu"):
+    """Build a normalized regular (Sylvester) Hadamard of a power-of-4 size."""
+    if size < 4 or (size & (size - 1)) != 0 or not math.log(size, 4).is_integer():
+        raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
+    h4 = torch.tensor(
+        [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+        dtype=dtype,
+        device=device,
+    )
+    h = h4
+    current_size = 4
+    while current_size < size:
+        h = torch.kron(h, h4)
+        current_size *= 4
+    return h / (size ** 0.5)
 
 
 def retired_quantize_int4_pytorch(weight, group_size=64):
@@ -1019,14 +1053,14 @@ def handle_tensors(
         # Q4_PT layout restrictions are retained with
         # retired_quantize_int4_pytorch and are intentionally not selectable.
 
-        # Q4_CR_M only supports Linear matrices whose K dimension is divisible
-        # by the group size. Anything else falls back to F16 to avoid a
-        # conversion-time crash on awkward shapes.
+        # Q4_CR_W4A4 only supports Linear matrices whose K dimension is divisible
+        # by the ConvRot group size (default 256). Anything else falls back to F16
+        # to avoid a conversion-time crash on awkward shapes.
         if (
-            quant_type_name == "Q4_CR_M"
+            quant_type_name == "Q4_CR_W4A4"
             and (
                 n_dims != 2
-                or data.shape[1] % Q4_CR_GROUP_SIZE != 0
+                or data.shape[1] % Q4_CR_W4A4_CONVROT_GROUP_SIZE != 0
             )
             and not key_matches(key, model_arch.keys_hiprec)
             and not key_matches(key, model_arch.keys_noquant)
@@ -1077,13 +1111,14 @@ def handle_tensors(
                 progress_callback("quantize", progress_offset + tensor_index, progress_total or len(state_dict))
             continue
 
-        # Q4_CR_M: custom W4A16 INT4 backed by comfy_kitchen's AWQ GEMV.
-        # Serializes kitchen-native packed uint4 (N, K//2) + per-group fp scales.
+        # Q4_CR_W4A4: custom W4A4 INT4 backed by comfy_kitchen's fast ConvRot
+        # int4 tensor-core MMA. Serializes kitchen-native packed int4 (N, K//2)
+        # + per-output-row fp scales (no per-group scales/zeros).
         if (
-            quant_type_name == "Q4_CR_M"
+            quant_type_name == "Q4_CR_W4A4"
             and data_qtype == gguf.GGMLQuantizationType.I8
             and n_dims == 2
-            and data.shape[1] % Q4_CR_GROUP_SIZE == 0
+            and data.shape[1] % Q4_CR_W4A4_CONVROT_GROUP_SIZE == 0
             and not key_matches(key, model_arch.keys_hiprec)
             and not key_matches(key, model_arch.keys_noquant)
         ):
@@ -1092,9 +1127,10 @@ def handle_tensors(
                 q4_cr_device = resolve_quantization_device(quantization_device)
             device = q4_cr_device
             try:
-                qdata, (wscales, wzeros), quant_conf, orig_shape = quantize_int4_cr(
+                qdata, wscales, quant_conf, orig_shape = quantize_int4_cr_w4a4(
                     qdata_q4,
-                    group_size=Q4_CR_GROUP_SIZE,
+                    convrot_groupsize=Q4_CR_W4A4_CONVROT_GROUP_SIZE,
+                    quant_group_size=Q4_CR_W4A4_QUANT_GROUP_SIZE,
                     device=device,
                 )
             except torch.OutOfMemoryError:
@@ -1102,12 +1138,13 @@ def handle_tensors(
                     raise
                 torch.cuda.empty_cache()
                 logging.warning(
-                    "Q4_CR CUDA fallback for %s: CUDA ran out of memory while quantizing.",
+                    "Q4_CR_W4A4 CUDA fallback for %s: CUDA ran out of memory while quantizing.",
                     key,
                 )
-                qdata, (wscales, wzeros), quant_conf, orig_shape = quantize_int4_cr(
+                qdata, wscales, quant_conf, orig_shape = quantize_int4_cr_w4a4(
                     qdata_q4,
-                    group_size=Q4_CR_GROUP_SIZE,
+                    convrot_groupsize=Q4_CR_W4A4_CONVROT_GROUP_SIZE,
+                    quant_group_size=Q4_CR_W4A4_QUANT_GROUP_SIZE,
                     device=torch.device("cpu"),
                 )
             writer.add_tensor(
@@ -1120,17 +1157,10 @@ def handle_tensors(
                 wscales.cpu().half().numpy(),
                 raw_dtype=gguf.GGMLQuantizationType.F16,
             )
-            writer.add_tensor(
-                f"{key}_zeros",
-                wzeros.cpu().half().numpy(),
-                raw_dtype=gguf.GGMLQuantizationType.F16,
-            )
             writer.add_string(f"comfy.gguf.quant.{key}", json.dumps(quant_conf))
             if progress_callback is not None:
                 progress_callback("quantize", progress_offset + tensor_index, progress_total or len(state_dict))
             continue
-
-            # Q4_PT emission is retired with its runtime backend.
 
         if (model_arch.shape_fix                        # NEVER reshape for models such as flux
             and n_dims > 1                              # Skip one-dimensional tensors

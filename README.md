@@ -95,25 +95,10 @@ python tools/convert.py --src /path/to/krea2_or_ideogram.safetensors \
 python tools/convert.py --src /path/to/krea2_or_ideogram.safetensors \
   --dst /path/to/model-Q8_CR.gguf --quant-type Q8_CR
 
-# Experimental INT4 (W4A16, group 64). Best effort; validate quality.
-# Weights stay INT4 in VRAM and run through a native INT4 tensor-core kernel
-# on supported NVIDIA GPUs (Ampere+). Requires comfy_kitchen.
-# Measured on RTX 3080 Laptop (sm_86): Q4_CR_M is SLOWER than Q8_CR at
-# diffusion M (its kernel dequantizes to bf16 + cuBLAS for M>256), so treat it
-# as a size/VRAM optimization, not a speed one. See the experimental note below.
+# Experimental INT4 (W4A4, native int4 tensor-core MMA)
 python tools/convert.py --src /path/to/krea2_or_ideogram.safetensors \
-  --dst /path/to/model-Q4_CR_M.gguf --quant-type Q4_CR_M
+  --dst /path/to/model-Q4_CR_W4A4.gguf --quant-type Q4_CR_W4A4
 ```
-
-> [!WARNING]
-> **Q4_CR_M is a size optimization, not a speed optimization.** On an RTX 3080
-> Laptop the full-precision-compute W4A16 kernel is roughly 3x *slower* than
-> `Q8_CR` (and ~2x slower than bf16 cuBLAS) at diffusion batch sizes, because the
-> backing `comfy_kitchen` `gemv_awq_w4a16` kernel dequantizes the int4 weight to
-> bf16 before the cuBLAS fallback for any M > 256. Use it when VRAM/disk is the
-> binding constraint; use `Q8_CR` when iteration speed matters. An in-repo
-> experimental Triton GEMM was prototyped and validated for correctness but
-> measured even slower (~3-7x) than `Q8_CR`; see `triton_int4.py`.
 
 For a native Minimax M3 checkpoint, use the same command:
 

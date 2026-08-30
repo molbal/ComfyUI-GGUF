@@ -28,7 +28,7 @@ CONVERTER = ROOT / "tools" / "convert.py"
 PAGE = Path(__file__).with_suffix(".html")
 SOURCE_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin"}
 LORA_EXTENSIONS = {".safetensors", ".gguf"}
-QUANT_TYPES = {"source", "Q8_0", "Q5_1", "Q5_0", "Q4_1", "Q4_0", "Q8_CR"}
+QUANT_TYPES = {"source", "Q8_0", "Q5_1", "Q5_0", "Q4_1", "Q4_0", "Q8_CR", "Q4_CR_W4A4"}
 Q8_TYPES = {"Q8_CR", "Q8_0"}
 DEVICES = {"auto", "cpu", "cuda"}
 
