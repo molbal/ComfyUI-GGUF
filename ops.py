@@ -524,51 +524,28 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
 
             def forward_comfy_cast_weights(self, input, *args, **kwargs):
                 bias = self.bias.to(device=input.device, dtype=input.dtype) if self.bias is not None else None
+                if bias is not None:
+                    for f in self.bias_function:
+                        bias = f(bias)
                 if not self._quantized or self.weight is None:
                     # Plain Linear path
                     weight = self.weight.to(device=input.device, dtype=input.dtype)
                     return torch.nn.functional.linear(input, weight, bias)
                 if self.weight_function or self.bias_function:
-                    # DynamicVRAM offload registers a weight_lowvram_function that is a
-                    # pure move-to-device, and it is promoted into weight_function. The
-                    # weight itself lives on the offload (CPU) device after staging, so
-                    # applying the function to `self.weight` would trigger a SYNCHRONOUS
-                    # CPU->GPU transfer of all packed weights on EVERY forward (measured
-                    # ~750 ms for the full model) -- that transfer is then discarded and
-                    # the cache rebuilt from CPU again. That is the dominant DynamicVRAM
-                    # cost for this path.
-                    #
-                    # Instead: first (re)build/reuse the device-resident cached
-                    # QuantizedTensor (moves weight+scale to the input device once per
-                    # device), then apply weight_function to the DEVICE-resident packed
-                    # qdata. A pure offload/relocate is a no-op on a tensor that is
-                    # already on the input device (returns the same int8, no transfer),
-                    # so the native kernel still runs. A genuine value-changing patch
-                    # computes on the dequantized weight and yields non-int8, which forces
-                    # the dequant fallback below. This keeps correctness for real LoRA/
-                    # patches while eliminating the per-forward transfer.
-                    weight_qt = self._get_cached_quantized_weight(input.device)
-                    if weight_qt is not None:
-                        qdata = weight_qt._qdata
-                        patched = qdata
-                        try:
-                            for f in self.weight_function:
-                                patched = f(patched)
-                        except Exception:
-                            patched = None
-                        if (
-                            isinstance(patched, torch.Tensor)
-                            and patched.dtype == torch.int8
-                            and patched.shape == qdata.shape
-                            and patched.device == input.device
-                        ):
-                            out = torch.nn.functional.linear(input, weight_qt)
-                            if bias is not None:
-                                out = out + bias
-                            return out
-                    # Real patch changed values beyond the packed int8 (or no kitchen):
-                    # dequantize and fall back to a full-precision matmul.
+                    # A real LoRA/LoKR/adapter patch is present. Dynamic VRAM promotes a
+                    # LowVramPatch into weight_function, and the adapter's factors are
+                    # floats, so they must be applied to the full-precision weight. If we
+                    # fed them the packed int8, the adapter would cast factors to
+                    # intermediate_dtype=weight.dtype (int8) and cuBLAS `addmm` would
+                    # throw "not implemented for 'Char'"; that exception is swallowed by
+                    # the adapter (it logs and returns the weight unchanged), so the patch
+                    # would be silently dropped. Dequantize first, apply every
+                    # weight_function to the full-precision (un-rotated) weight, and run an
+                    # FP matmul. This bypasses the INT4 tensor-core kernel while a real
+                    # patch is active, mirroring the Q8_CR behavior.
                     _orig_w = self._dequantized_weight(input.device, input.dtype)
+                    for f in self.weight_function:
+                        _orig_w = f(_orig_w)
                     return torch.nn.functional.linear(input, _orig_w, bias)
 
                 weight_qt = self._get_cached_quantized_weight(input.device)

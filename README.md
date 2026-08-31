@@ -324,7 +324,10 @@ convolutional factors, and non-LoRA adapter types are rejected.
 
 Imported GGUF LoRAs retain normal dynamic-patch behavior. They are a
 compatibility feature, not an INT8 acceleration: an active LoRA prevents
-`Q8_CR` Linear layers from staying on their native INT8 fast path.
+`Q8_CR` Linear layers from staying on their native INT8 fast path. The same
+applies to the experimental `Q4_CR_W4A4` path: an active LoRA dequantizes the
+INT4 weights and runs a full-precision matmul, so the INT4 tensor-core kernel
+is bypassed while the LoRA is applied.
 
 For a fixed adapter combination, merge the adapters while exporting with
 `tools/convert.py --lora path/to/adapter.safetensors` (repeat `--lora` for
