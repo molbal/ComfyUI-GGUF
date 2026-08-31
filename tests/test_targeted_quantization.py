@@ -1814,6 +1814,58 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         self.assertIsNotNone(lin._fused_quantized_weight)
         self.assertIsNone(lin._quantized_weight)
 
+    def test_int4_cr_w4a4_ops_eager_fusion_and_cache_eviction(self):
+        ops = ops_factory()
+        lin = ops.Linear(64, 64, bias=True)
+        weight = torch.randn(64, 512, dtype=torch.float32)
+        packed, wscales, quant_conf, _ = quantize_int4_cr_w4a4(
+            weight, convrot_groupsize=256, quant_group_size=64, device=torch.device("cpu")
+        )
+        quant_conf["orig_shape"] = [64, 512]
+        lin._load_from_state_dict(
+            {
+                "weight": packed,
+                "weight_scale": wscales.half(),
+                "comfy_quant": torch.tensor(list(json.dumps(quant_conf).encode("utf-8"))),
+                "bias": torch.zeros(64, dtype=torch.float32),
+            },
+            prefix="",
+            local_metadata={},
+            strict=True,
+            missing_keys=[],
+            unexpected_keys=[],
+            error_msgs=[],
+        )
+
+        calls = []
+
+        def patch(t, *args, **kwargs):
+            calls.append(None)
+            return t + 0.25
+
+        lin.weight_function = [patch]
+        lin._get_cached_quantized_weight(torch.device("cpu"))
+        self.assertIsNotNone(lin._quantized_weight)
+        self.assertTrue(lin.prepare_fused_weight(torch.device("cpu")))
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(lin._quantized_weight)
+        first_fused = id(lin._fused_quantized_weight)
+        first_patch_id = lin._fused_patch_id
+
+        lin(torch.randn(2, 512))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(id(lin._fused_quantized_weight), first_fused)
+
+        lin.weight_function = [lambda t, *args, **kwargs: t - 0.25]
+        self.assertTrue(lin.prepare_fused_weight(torch.device("cpu")))
+        self.assertIsNone(lin._quantized_weight)
+        self.assertNotEqual(lin._fused_patch_id, first_patch_id)
+
+        lin.evict_quantized_caches()
+        self.assertIsNone(lin._quantized_weight)
+        self.assertIsNone(lin._fused_quantized_weight)
+        self.assertIsNone(lin._fused_bias)
+
     def test_int4_cr_w4a4_ops_lora_patch_fused_and_requantized(self):
         # A real LoRA patch must be applied to the dequantized (full-precision,
         # un-rotated) weight (so its delta is not silently dropped) and then the fused
@@ -1956,6 +2008,43 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         self.assertEqual(out.shape, (8, 64))
         self.assertIsNotNone(lin._fused_quantized_weight)
         self.assertNotEqual(lin._fused_patch_signature(), sig1)
+
+    def test_performance_log_records_quantized_forward(self):
+        import sys
+
+        ops_factory()
+        ops_module = sys.modules["comfyui_gguf_test.ops"]
+        with TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "performance.log"
+            with mock.patch.dict(os.environ, {ops_module._PERF_LOG_ENV: str(log_path)}):
+                logger = ops_module._configure_perf_logger()
+                self.assertIsNotNone(logger)
+                handler = logger.handlers[-1]
+                previous_logger = ops_module._PERF_LOGGER
+                ops_module._PERF_LOGGER = logger
+                try:
+                    class FakeLayer:
+                        in_features = 16
+                        out_features = 32
+
+                    input_tensor = torch.zeros((2, 16), dtype=torch.float32)
+                    result = ops_module._perf_forward(
+                        "int4_convrot_w4a4",
+                        FakeLayer(),
+                        input_tensor,
+                        lambda: input_tensor + 1,
+                    )
+                    self.assertTrue(torch.equal(result, torch.ones_like(input_tensor)))
+                    handler.flush()
+                    contents = log_path.read_text(encoding="utf-8")
+                finally:
+                    ops_module._PERF_LOGGER = previous_logger
+                    logger.removeHandler(handler)
+                    handler.close()
+
+        self.assertIn("forward mode=int4_convrot_w4a4", contents)
+        self.assertIn("elapsed_ms=", contents)
+        self.assertIn("input_shape=(2, 16)", contents)
 
 
 if __name__ == "__main__":

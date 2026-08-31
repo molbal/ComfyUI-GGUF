@@ -78,6 +78,45 @@ class GGUFLoadProgress:
 class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     patch_on_device = False
 
+    def _evict_gguf_quantized_caches(self):
+        for module in self.model.modules():
+            evict = getattr(module, "evict_quantized_caches", None)
+            if evict is not None:
+                evict()
+
+    def _move_gguf_quantized_caches(self, device):
+        for module in self.model.modules():
+            move = getattr(module, "move_fused_caches", None)
+            if move is not None:
+                move(device)
+
+    def _prepare_gguf_quantized_weights(self, device=None):
+        """Prepare all active INT4 adapter fusions before the model is used."""
+        prepared = []
+        layout = []
+        modules = []
+        for name, module in self.model.named_modules():
+            signature = getattr(module, "_fused_patch_signature", None)
+            prepare = getattr(module, "prepare_fused_weight", None)
+            if signature is None or prepare is None:
+                continue
+            module_signature = signature()
+            layout.append((name, module_signature))
+            modules.append((module, module_signature))
+
+        layout = tuple(layout)
+        previous_layout = getattr(self, "_gguf_patch_layout_signature", None)
+        if previous_layout is not None and previous_layout != layout:
+            self._evict_gguf_quantized_caches()
+        self._gguf_patch_layout_signature = layout
+
+        if device is None:
+            device = getattr(self, "offload_device", None)
+        for module, _ in modules:
+            if module.prepare_fused_weight(device):
+                prepared.append(module)
+        return len(prepared)
+
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
         if key not in self.patches:
             return
@@ -87,6 +126,10 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         if is_quantized(weight):
             out_weight = weight.to(device_to)
             patches = move_patch_to_device(patches, self.load_device if self.patch_on_device else self.offload_device)
+            module = comfy.utils.get_attr(self.model, key.rsplit('.', 1)[0])
+            install_patch = getattr(module, "install_patch_entries", None)
+            if install_patch is not None:
+                install_patch(patches, key)
             # TODO: do we ever have legitimate duplicate patches? (i.e. patch on top of patched weight)
             out_weight.patches = [(patches, key)]
         else:
@@ -111,6 +154,13 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         if unpatch_weights:
+            self._evict_gguf_quantized_caches()
+            self._gguf_patch_layout_signature = None
+            for module in self.model.modules():
+                if getattr(module, "_gguf_static_patch", False):
+                    module.weight_function = []
+                    module._gguf_static_patch = False
+        if unpatch_weights:
             for p in self.model.parameters():
                 if is_torch_compatible(p):
                     continue
@@ -133,7 +183,12 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     named_modules_to_munmap = {}
 
     def partially_unload(self, *args, force_patch_weights=False, **kwargs):
-        return super().partially_unload(*args, force_patch_weights=True, **kwargs)
+        result = super().partially_unload(*args, force_patch_weights=True, **kwargs)
+        if args:
+            self._move_gguf_quantized_caches(args[0])
+        elif "device_to" in kwargs:
+            self._move_gguf_quantized_caches(kwargs["device_to"])
+        return result
 
     def partially_load(self, *args, force_patch_weights=False, **kwargs):
         return super().partially_load(*args, force_patch_weights=True, **kwargs)
@@ -144,6 +199,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
 
         # always call `patch_weight_to_device` even for lowvram
         super().load(*args, force_patch_weights=True, **kwargs)
+        self._prepare_gguf_quantized_weights()
 
         # make sure nothing stays linked to mmap after first load
         if not self.mmap_released:
@@ -177,6 +233,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         # GGUF specific clone values below
         n.patch_on_device = getattr(self, "patch_on_device", False)
         n.mmap_released = getattr(self, "mmap_released", False)
+        n._gguf_patch_layout_signature = getattr(self, "_gguf_patch_layout_signature", None)
         if src_cls != GGUFModelPatcher:
             n.size = 0 # force recalc
         return n
@@ -712,6 +769,23 @@ def _load_dynamic_gguf_unet(unet_path, disable_dynamic=False, progress=None):
 
 
 class GGUFModelPatcherDynamic(comfy.model_patcher.ModelPatcherDynamic):
+    _evict_gguf_quantized_caches = GGUFModelPatcher._evict_gguf_quantized_caches
+    _move_gguf_quantized_caches = GGUFModelPatcher._move_gguf_quantized_caches
+    _prepare_gguf_quantized_weights = GGUFModelPatcher._prepare_gguf_quantized_weights
+
+    def unpatch_model(self, device_to=None, unpatch_weights=True):
+        if unpatch_weights:
+            self._evict_gguf_quantized_caches()
+            self._gguf_patch_layout_signature = None
+        return super().unpatch_model(device_to=device_to, unpatch_weights=unpatch_weights)
+
+    def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
+        result = super().partially_unload(
+            device_to, memory_to_free=memory_to_free, force_patch_weights=force_patch_weights
+        )
+        self._move_gguf_quantized_caches(device_to)
+        return result
+
     def load(self, *args, **kwargs):
         super().load(*args, **kwargs)
         # GGML weights cannot be requantized after applying a LoRA patch.
@@ -724,6 +798,7 @@ class GGUFModelPatcherDynamic(comfy.model_patcher.ModelPatcherDynamic):
                     functions = getattr(module, f"{param_key}_function", [])
                     functions.append(lowvram_function)
                     setattr(module, f"{param_key}_function", functions)
+        self._prepare_gguf_quantized_weights()
 
     def clone(self, disable_dynamic=False, model_override=None):
         if disable_dynamic:

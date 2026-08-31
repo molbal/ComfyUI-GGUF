@@ -130,6 +130,21 @@ For the portable Windows distribution, use its embedded Python executable:
   --quantization-device auto
 ```
 
+### Optional quantized-layer performance log
+
+Set `COMFYUI_GGUF_PERF_LOG` before starting ComfyUI to write native INT8 and
+ConvRot INT4 Linear timings to a separate file. Its value is the log path:
+
+```powershell
+$env:COMFYUI_GGUF_PERF_LOG = 'C:\Temp\comfyui-gguf-performance.log'
+python main.py
+```
+
+Using `1`, `true`, `yes`, or `on` writes `comfyui-gguf-performance.log` in the
+current directory. Timings synchronize CUDA only for this diagnostic mode.
+INT4 LoRA fusion is completed during model loading; compare forward calls with
+the same workflow when checking steady-state INT4 versus INT8 performance.
+
 ### Local conversion dashboard
 
 For a local browser UI that queues conversions and shows the converter's live
@@ -341,14 +356,12 @@ compatibility feature, not an INT8 acceleration: an active LoRA prevents
 experimental `Q4_CR_W4A4` path instead fuses the active adapter in full
 precision and re-quantizes the fused weight back into the INT4 ConvRot layout,
 so the native int4 tensor-core kernel stays active while a LoRA/LoKR is
-loaded. The fused, re-quantized weight is cached per patch signature (one
-Hadamard rotate + int4 pack per patch, not per forward); if re-quantization is
-unavailable, it falls back to a dequantized matmul for correctness. Under
-Dynamic VRAM the patch object is recreated each time the model is moved to
-device, so the cache is keyed on the patch's stable content (tensor key plus
-the model-patcher-held patches list identity) rather than the patch object
-identity, ensuring the fused weight is rebuilt only when the adapter actually
-changes.
+loaded. The fused, re-quantized weights are prepared while the model is loaded,
+so the Hadamard rotate + int4 pack cost is not paid during sampling. Only the
+active fused representation is retained for each layer; if re-quantization is
+unavailable, that layer falls back to a dequantized matmul for correctness.
+When a model or LoRA patch layout changes, all derived quantized caches are
+evicted before the new active representation is prepared.
 
 For a fixed adapter combination, merge the adapters while exporting with
 `tools/convert.py --lora path/to/adapter.safetensors` (repeat `--lora` for

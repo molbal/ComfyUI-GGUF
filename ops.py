@@ -3,11 +3,104 @@ import gguf
 import json
 import torch
 import logging
+import os
+import time
 
 import comfy.ops
 import comfy.lora
 import comfy.model_management
 from .dequant import dequantize_tensor, is_quantized
+
+
+_PERF_LOG_ENV = "COMFYUI_GGUF_PERF_LOG"
+
+
+def _configure_perf_logger():
+    # log_path = os.environ.get(_PERF_LOG_ENV)
+    # if not log_path:
+#         return None
+    # if log_path.strip().lower() in {"1", "true", "yes", "on"}:
+    log_path = "comfyui-gguf-performance.log"
+
+    logger = logging.getLogger("comfyui_gguf.performance")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+    except (OSError, ValueError) as error:
+        logging.getLogger(__name__).warning(
+            "ComfyUI-GGUF: unable to open performance log %r: %s", log_path, error
+        )
+        return None
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    handler._comfyui_gguf_perf = True
+    logger.addHandler(handler)
+    logger.info("performance logging enabled path=%s", log_path)
+    return logger
+
+
+_PERF_LOGGER = _configure_perf_logger()
+
+
+def _perf_sync(device):
+    if device is not None and getattr(device, "type", None) == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def _perf_forward(mode, layer, input_tensor, operation):
+    """Run and optionally time one quantized Linear forward.
+
+    CUDA synchronization is deliberately limited to the opt-in diagnostic path;
+    normal inference does not pay for timing or synchronization overhead.
+    """
+    if _PERF_LOGGER is None:
+        return operation()
+
+    device = getattr(input_tensor, "device", None)
+    _perf_sync(device)
+    started = time.perf_counter()
+    call_number = getattr(layer, "_gguf_perf_calls", 0) + 1
+    layer._gguf_perf_calls = call_number
+    cache_before = getattr(layer, "_quantized_weight", None) is not None
+    fused_cache_before = getattr(layer, "_fused_quantized_weight", None) is not None
+    try:
+        result = operation()
+        _perf_sync(device)
+    except BaseException:
+        _perf_sync(device)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        _PERF_LOGGER.exception(
+            "forward mode=%s call=%d in_features=%s out_features=%s "
+            "input_shape=%s device=%s elapsed_ms=%.3f failed=true",
+            mode,
+            call_number,
+            getattr(layer, "in_features", None),
+            getattr(layer, "out_features", None),
+            tuple(getattr(input_tensor, "shape", ())),
+            device,
+            elapsed_ms,
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    _PERF_LOGGER.info(
+        "forward mode=%s call=%d in_features=%s out_features=%s "
+        "input_shape=%s device=%s elapsed_ms=%.3f cache_before=%s cache_after=%s "
+        "fused_cache_before=%s fused_cache_after=%s patched=%s",
+        mode,
+        call_number,
+        getattr(layer, "in_features", None),
+        getattr(layer, "out_features", None),
+        tuple(getattr(input_tensor, "shape", ())),
+        device,
+        elapsed_ms,
+        cache_before,
+        getattr(layer, "_quantized_weight", None) is not None,
+        fused_cache_before,
+        getattr(layer, "_fused_quantized_weight", None) is not None,
+        bool(getattr(layer, "weight_function", ())) or bool(getattr(layer, "bias_function", ())),
+    )
+    return result
 
 def _build_regular_hadamard(size, dtype=torch.float32, device="cpu"):
     """Build a normalized regular (Sylvester) Hadamard of a power-of-4 size."""
@@ -371,6 +464,16 @@ def get_gguf_q8_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 self._full_precision_mm = BaseOps._full_precision_mm
                 self._full_precision_mm_config = False
 
+            def forward(self, *args, **kwargs):
+                input_tensor = args[0] if args else kwargs.get("input")
+                parent_forward = super().forward
+                return _perf_forward(
+                    "int8_tensorwise",
+                    self,
+                    input_tensor,
+                    lambda: parent_forward(*args, **kwargs),
+                )
+
             def _load_from_state_dict(self, *args):
                 state_dict, prefix = args[:2]
                 weight_key = f"{prefix}weight"
@@ -442,6 +545,20 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 self._fused_quantized_weight = None
                 self._fused_patch_id = None
                 self._fused_quantized_weight_device = None
+                self._fused_bias = None
+                self._fused_bias_patch_id = None
+                self._fused_bias_device = None
+
+            def install_patch_entries(self, patches, key):
+                """Expose a static patch as the same callable used by Dynamic VRAM."""
+                self.evict_quantized_caches()
+
+                def apply_patch(weight, *args, **kwargs):
+                    return comfy.lora.calculate_weight(patches, weight, key)
+
+                apply_patch._gguf_static_patch = True
+                self.weight_function = [apply_patch]
+                self._gguf_static_patch = True
 
             def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs):
@@ -498,6 +615,30 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 self._fused_quantized_weight = None
                 self._fused_patch_id = None
                 self._fused_quantized_weight_device = None
+                self._fused_bias = None
+                self._fused_bias_patch_id = None
+                self._fused_bias_device = None
+
+            def evict_quantized_caches(self):
+                """Release every derived representation of this quantized layer."""
+                self._quantized_weight = None
+                self._quantized_weight_device = None
+                self._fused_quantized_weight = None
+                self._fused_patch_id = None
+                self._fused_quantized_weight_device = None
+                self._fused_bias = None
+                self._fused_bias_patch_id = None
+                self._fused_bias_device = None
+                self._fused_patch_keepalive = ()
+
+            def move_fused_caches(self, device):
+                """Move prepared patched caches without rebuilding them."""
+                if self._fused_quantized_weight is not None and self._fused_quantized_weight_device != str(device):
+                    self._fused_quantized_weight = self._fused_quantized_weight.to(device=device)
+                    self._fused_quantized_weight_device = str(device)
+                if self._fused_bias is not None and self._fused_bias_device != str(device):
+                    self._fused_bias = self._fused_bias.to(device=device)
+                    self._fused_bias_device = str(device)
 
             def _build_quantized_weight(self, device, dtype, packed=None):
                 if not _HAVE_KITCHEN:
@@ -592,6 +733,60 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 )
                 return QuantizedTensor(packed, "TensorCoreConvRotW4A4Layout", params)
 
+            def _get_cached_fused_bias(self, device, patch_id=None):
+                bias_functions = list(getattr(self, "bias_function", ()))
+                if not bias_functions:
+                    return self.bias.to(device=device, dtype=self._compute_dtype) if self.bias is not None else None
+                patch_id = patch_id if patch_id is not None else self._fused_patch_signature()
+                if (
+                    self._fused_bias is not None
+                    and self._fused_bias_patch_id == patch_id
+                    and self._fused_bias_device == str(device)
+                ):
+                    return self._fused_bias
+                if self.bias is None:
+                    self._fused_bias = None
+                    self._fused_bias_patch_id = patch_id
+                    self._fused_bias_device = str(device)
+                    return None
+                bias = self.bias.to(device=device, dtype=self._compute_dtype)
+                for f in bias_functions:
+                    bias = f(bias)
+                self._fused_bias = bias
+                self._fused_bias_patch_id = patch_id
+                self._fused_bias_device = str(device)
+                return bias
+
+            def prepare_fused_weight(self, device):
+                """Fuse the active patch set before inference starts.
+
+                The fused representation is kept on one device only. Moving a
+                prepared representation between CPU and CUDA is allowed, but a
+                patch/layout change evicts both the base and fused derived caches
+                before rebuilding them.
+                """
+                if not self._quantized or self.weight is None:
+                    return False
+                weight_functions = list(getattr(self, "weight_function", ()))
+                bias_functions = list(getattr(self, "bias_function", ()))
+                if not weight_functions and not bias_functions:
+                    if self._fused_quantized_weight is not None or self._fused_bias is not None:
+                        self.evict_quantized_caches()
+                    return False
+
+                patch_id = self._fused_patch_signature()
+                if self._fused_patch_id is not None and self._fused_patch_id != patch_id:
+                    self.evict_quantized_caches()
+
+                fused = True
+                if weight_functions:
+                    self._quantized_weight = None
+                    self._quantized_weight_device = None
+                    fused = self._get_cached_fused_quantized_weight(device) is not None
+                if bias_functions:
+                    self._get_cached_fused_bias(device, patch_id=patch_id)
+                return fused
+
             def _get_cached_fused_quantized_weight(self, device):
                 """Fuse active LoRA/LoKR adapters and re-quantize onto the fast kernel.
 
@@ -606,6 +801,10 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 patch cannot be re-quantized), signalling the caller to fall back to the
                 dequantized matmul.
                 """
+                # A patched layer must never retain the ordinary packed cache alongside
+                # either a fused representation or the dequantized fallback.
+                self._quantized_weight = None
+                self._quantized_weight_device = None
                 if not _HAVE_KITCHEN or quantize_convrot_w4a4_weight is None:
                     return None
                 sig = self._fused_patch_signature()
@@ -615,9 +814,23 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                     and self._fused_quantized_weight_device == str(device)
                 ):
                     return self._fused_quantized_weight
+                if self._fused_quantized_weight is not None and self._fused_patch_id == sig:
+                    try:
+                        self._fused_quantized_weight = self._fused_quantized_weight.to(device=device)
+                        self._fused_quantized_weight_device = str(device)
+                        return self._fused_quantized_weight
+                    except Exception:
+                        self.evict_quantized_caches()
+                elif self._fused_quantized_weight is not None:
+                    self.evict_quantized_caches()
+                else:
+                    # Do not retain the ordinary packed device cache while the
+                    # patched representation is being prepared.
+                    self._quantized_weight = None
+                    self._quantized_weight_device = None
                 # Fuse adapters in the compute (BF16) domain on the un-rotated weight.
                 fused = self._dequantized_weight(device, self._compute_dtype)
-                for f in self.weight_function:
+                for f in getattr(self, "weight_function", ()):
                     fused = f(fused)
                 try:
                     packed, wscales = quantize_convrot_w4a4_weight(
@@ -634,18 +847,33 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 self._fused_quantized_weight = qt
                 self._fused_patch_id = sig
                 self._fused_quantized_weight_device = str(device)
+                self._quantized_weight = None
+                self._quantized_weight_device = None
                 return qt
 
             def forward_comfy_cast_weights(self, input, *args, **kwargs):
-                bias = self.bias.to(device=input.device, dtype=input.dtype) if self.bias is not None else None
-                if bias is not None:
-                    for f in self.bias_function:
-                        bias = f(bias)
+                has_weight_functions = bool(getattr(self, "weight_function", ()))
+                has_bias_functions = bool(getattr(self, "bias_function", ()))
+                if not has_weight_functions and not has_bias_functions and (
+                    self._fused_quantized_weight is not None or self._fused_bias is not None
+                ):
+                    self.evict_quantized_caches()
+                patch_id = self._fused_patch_signature() if (has_weight_functions or has_bias_functions) else None
+                if has_bias_functions and self._fused_bias_patch_id == patch_id:
+                    if self._fused_bias is not None and self._fused_bias_device != str(input.device):
+                        self._fused_bias = self._fused_bias.to(device=input.device)
+                        self._fused_bias_device = str(input.device)
+                    bias = self._fused_bias.to(dtype=input.dtype) if self._fused_bias is not None else None
+                else:
+                    bias = self.bias.to(device=input.device, dtype=input.dtype) if self.bias is not None else None
+                    if bias is not None:
+                        for f in getattr(self, "bias_function", ()):
+                            bias = f(bias)
                 if not self._quantized or self.weight is None:
                     # Plain Linear path
                     weight = self.weight.to(device=input.device, dtype=input.dtype)
                     return torch.nn.functional.linear(input, weight, bias)
-                if self.weight_function or self.bias_function:
+                if has_weight_functions or has_bias_functions:
                     # A real LoRA/LoKR/adapter patch is present. Dynamic VRAM promotes a
                     # LowVramPatch into weight_function, and the adapter's factors are
                     # floats, so they must be applied to the full-precision weight. We
@@ -663,7 +891,7 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                         return out
                     # No kitchen or unfusable patch: dequantize and run an FP matmul.
                     _orig_w = self._dequantized_weight(input.device, input.dtype)
-                    for f in self.weight_function:
+                    for f in getattr(self, "weight_function", ()):
                         _orig_w = f(_orig_w)
                     return torch.nn.functional.linear(input, _orig_w, bias)
 
@@ -679,14 +907,19 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 return out
 
             def forward(self, *args, **kwargs):
-                comfy.ops.run_every_op()
-                if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
-                    return self.forward_comfy_cast_weights(*args, **kwargs)
-                return torch.nn.functional.linear(
-                    input=args[0],
-                    weight=self.weight,
-                    bias=self.bias,
-                )
+                input_tensor = args[0] if args else kwargs.get("input")
+
+                def run_forward():
+                    comfy.ops.run_every_op()
+                    if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
+                        return self.forward_comfy_cast_weights(*args, **kwargs)
+                    return torch.nn.functional.linear(
+                        input=input_tensor,
+                        weight=self.weight,
+                        bias=self.bias,
+                    )
+
+                return _perf_forward("int4_convrot_w4a4", self, input_tensor, run_forward)
 
             def _dequantized_weight(self, device, dtype):
                 packed = self.weight.to(device=device).to(torch.int8)
