@@ -406,11 +406,15 @@ def get_gguf_q8_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
 # basis, so output is directly in the original space.
 def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
     try:
-        from comfy_kitchen.tensor.convrot_w4a4 import TensorCoreConvRotW4A4Layout
+        from comfy_kitchen.tensor.convrot_w4a4 import (
+            TensorCoreConvRotW4A4Layout,
+            quantize_convrot_w4a4_weight,
+        )
         from comfy_kitchen.tensor.base import QuantizedTensor
         _HAVE_KITCHEN = True
     except Exception:
         TensorCoreConvRotW4A4Layout = None
+        quantize_convrot_w4a4_weight = None
         QuantizedTensor = None
         _HAVE_KITCHEN = False
 
@@ -432,6 +436,12 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 self._compute_dtype = torch.bfloat16
                 self._quantized_weight = None
                 self._quantized_weight_device = None
+                # Cache for a re-quantized fused (LoRA/LoKR) weight. Re-quantization
+                # (Hadamard rotate + int4 pack) is expensive, so it runs once per
+                # patch identity, not once per forward.
+                self._fused_quantized_weight = None
+                self._fused_patch_id = None
+                self._fused_quantized_weight_device = None
 
             def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs):
@@ -485,6 +495,9 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 self._compute_dtype = quant_conf.get("orig_dtype", torch.bfloat16)
                 self._quantized_weight = None
                 self._quantized_weight_device = None
+                self._fused_quantized_weight = None
+                self._fused_patch_id = None
+                self._fused_quantized_weight_device = None
 
             def _build_quantized_weight(self, device, dtype, packed=None):
                 if not _HAVE_KITCHEN:
@@ -522,53 +535,136 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 self._quantized_weight_device = str(device)
                 return qt
 
+            def _fused_patch_signature(self):
+                """A cheap, stable identity for the active weight/bias patch set.
+
+                ComfyUI installs the adapter (LoRA/LoKR) functions once per model
+                load/patch, so the callable objects are stable across forwards. We key
+                the fused-weight cache on the callable objects themselves so a re-bound
+                patch (even if a function object is reused) is detected and re-fused.
+
+                Under Dynamic VRAM, however, ``GGUFModelPatcherDynamic.load`` promotes a
+                freshly created ``LowVramPatch`` into ``weight_function`` every time the
+                model is moved to device. That object is recreated on each reload, so
+                keying the cache on ``id(f)`` would miss on every forward and re-run the
+                expensive Hadamard rotate + int4 pack (a 12x slowdown on large layers).
+                For ``LowVramPatch`` we therefore key on its stable *content*: the tensor
+                key and the identity of the shared patches dict/list (both live on the
+                model patcher and survive recreation). A genuine patch change (e.g. a new
+                ``add_patches`` call) rebuilds that list, which is detected as a change.
+                All other adapter callables are stable objects, so we key on them directly.
+                """
+                sig = []
+                keepalive = []
+                for f in list(getattr(self, "weight_function", ())) + list(getattr(self, "bias_function", ())):
+                    if getattr(f, "is_lowvram_patch", False) and getattr(f, "key", None):
+                        patches = getattr(f, "patches", None)
+                        plist = patches.get(f.key) if patches is not None else None
+                        if patches is not None:
+                            keepalive.append(patches)
+                        if plist is not None:
+                            keepalive.append(plist)
+                        sig.append(("lowvram", f.key, id(patches), id(plist)))
+                    else:
+                        sig.append(("callable", f))
+                # Keep references alive so address reuse never aliases a stale signature.
+                self._fused_patch_keepalive = tuple(keepalive)
+                return tuple(sig)
+
+            def _build_fused_quantized_weight(self, device, packed, wscales):
+                """Build a QuantizedTensor from a re-quantized (fused) weight.
+
+                Unlike ``_build_quantized_weight`` this uses the freshly recomputed
+                per-row scales produced by re-quantizing a fused (LoRA) weight rather
+                than the original on-disk ``weight_scale``.
+                """
+                if not _HAVE_KITCHEN:
+                    return None
+                packed = packed.to(device=device).to(torch.int8)
+                scale = wscales.to(device=device, dtype=torch.float32).contiguous()
+                params = TensorCoreConvRotW4A4Layout.Params(
+                    scale=scale,
+                    orig_dtype=self._compute_dtype,
+                    orig_shape=self._orig_shape,
+                    convrot_groupsize=self._convrot_groupsize,
+                    quant_group_size=self._quant_group_size,
+                    linear_dtype="int4",
+                )
+                return QuantizedTensor(packed, "TensorCoreConvRotW4A4Layout", params)
+
+            def _get_cached_fused_quantized_weight(self, device):
+                """Fuse active LoRA/LoKR adapters and re-quantize onto the fast kernel.
+
+                ``weight_function`` holds either a real LoRA/LoKR adapter (float deltas)
+                or, under DynamicVRAM, a pure weight-relocate patch. Both are applied to
+                the full-precision (un-rotated) weight, then the fused weight is packed
+                back into the ConvRot int4 layout. The result is cached per patch
+                signature so the expensive Hadamard rotate + int4 pack runs only once per
+                patch, not once per forward.
+
+                Returns ``None`` when fusion is unavailable (no comfy_kitchen, or the
+                patch cannot be re-quantized), signalling the caller to fall back to the
+                dequantized matmul.
+                """
+                if not _HAVE_KITCHEN or quantize_convrot_w4a4_weight is None:
+                    return None
+                sig = self._fused_patch_signature()
+                if (
+                    self._fused_quantized_weight is not None
+                    and self._fused_patch_id == sig
+                    and self._fused_quantized_weight_device == str(device)
+                ):
+                    return self._fused_quantized_weight
+                # Fuse adapters in the compute (BF16) domain on the un-rotated weight.
+                fused = self._dequantized_weight(device, self._compute_dtype)
+                for f in self.weight_function:
+                    fused = f(fused)
+                try:
+                    packed, wscales = quantize_convrot_w4a4_weight(
+                        fused,
+                        convrot_groupsize=self._convrot_groupsize,
+                        quant_group_size=self._quant_group_size,
+                        stochastic_rounding=0,
+                    )
+                except Exception:
+                    # Unfusable patch (e.g. altered shape). Fall back to dequant matmul.
+                    self._fused_quantized_weight = None
+                    return None
+                qt = self._build_fused_quantized_weight(device, packed, wscales)
+                self._fused_quantized_weight = qt
+                self._fused_patch_id = sig
+                self._fused_quantized_weight_device = str(device)
+                return qt
+
             def forward_comfy_cast_weights(self, input, *args, **kwargs):
                 bias = self.bias.to(device=input.device, dtype=input.dtype) if self.bias is not None else None
+                if bias is not None:
+                    for f in self.bias_function:
+                        bias = f(bias)
                 if not self._quantized or self.weight is None:
                     # Plain Linear path
                     weight = self.weight.to(device=input.device, dtype=input.dtype)
                     return torch.nn.functional.linear(input, weight, bias)
                 if self.weight_function or self.bias_function:
-                    # DynamicVRAM offload registers a weight_lowvram_function that is a
-                    # pure move-to-device, and it is promoted into weight_function. The
-                    # weight itself lives on the offload (CPU) device after staging, so
-                    # applying the function to `self.weight` would trigger a SYNCHRONOUS
-                    # CPU->GPU transfer of all packed weights on EVERY forward (measured
-                    # ~750 ms for the full model) -- that transfer is then discarded and
-                    # the cache rebuilt from CPU again. That is the dominant DynamicVRAM
-                    # cost for this path.
-                    #
-                    # Instead: first (re)build/reuse the device-resident cached
-                    # QuantizedTensor (moves weight+scale to the input device once per
-                    # device), then apply weight_function to the DEVICE-resident packed
-                    # qdata. A pure offload/relocate is a no-op on a tensor that is
-                    # already on the input device (returns the same int8, no transfer),
-                    # so the native kernel still runs. A genuine value-changing patch
-                    # computes on the dequantized weight and yields non-int8, which forces
-                    # the dequant fallback below. This keeps correctness for real LoRA/
-                    # patches while eliminating the per-forward transfer.
-                    weight_qt = self._get_cached_quantized_weight(input.device)
-                    if weight_qt is not None:
-                        qdata = weight_qt._qdata
-                        patched = qdata
-                        try:
-                            for f in self.weight_function:
-                                patched = f(patched)
-                        except Exception:
-                            patched = None
-                        if (
-                            isinstance(patched, torch.Tensor)
-                            and patched.dtype == torch.int8
-                            and patched.shape == qdata.shape
-                            and patched.device == input.device
-                        ):
-                            out = torch.nn.functional.linear(input, weight_qt)
-                            if bias is not None:
-                                out = out + bias
-                            return out
-                    # Real patch changed values beyond the packed int8 (or no kitchen):
-                    # dequantize and fall back to a full-precision matmul.
+                    # A real LoRA/LoKR/adapter patch is present. Dynamic VRAM promotes a
+                    # LowVramPatch into weight_function, and the adapter's factors are
+                    # floats, so they must be applied to the full-precision weight. We
+                    # fuse them into the (un-rotated) BF16 weight, then re-quantize back
+                    # into the ConvRot int4 layout so the fast tensor-core kernel stays
+                    # active while an adapter is loaded. The fused weight is cached per
+                    # patch signature (see _get_cached_fused_quantized_weight). If fusion
+                    # is unavailable or fails (no comfy_kitchen / altered shape), fall
+                    # back to a dequantized FP matmul for correctness.
+                    fused_qt = self._get_cached_fused_quantized_weight(input.device)
+                    if fused_qt is not None:
+                        out = torch.nn.functional.linear(input, fused_qt)
+                        if bias is not None:
+                            out = out + bias
+                        return out
+                    # No kitchen or unfusable patch: dequantize and run an FP matmul.
                     _orig_w = self._dequantized_weight(input.device, input.dtype)
+                    for f in self.weight_function:
+                        _orig_w = f(_orig_w)
                     return torch.nn.functional.linear(input, _orig_w, bias)
 
                 weight_qt = self._get_cached_quantized_weight(input.device)

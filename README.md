@@ -7,6 +7,19 @@ GGUF Quantization support for native ComfyUI models including the custom Q8_CR
 
 While quantization wasn't feasible for regular UNET models (conv2d), transformer/DiT models such as flux seem less affected by quantization. This allows running it in much lower bits per weight variable bitrate quants on low-end GPUs. For further VRAM savings, a node to load a quantized version of the T5 text encoder is also included.
 
+## TLDR?
+
+These are actively maintained GGUF loader nodes, with support for custom INT8 and INT4 GGUF formats.
+
+Compatible with your existing workflows, just replace the 'Load Diffusion Model' node with 'Unet Loader (Dynamic VRAM)' or 'Unet Loader (GGUF)' nodes.
+
+**Need more info?**
+
+- More documentation here: https://molbal.github.io/gguf/ecosystem/using-the-custom-nodes.html
+- Request a new (currently unsupported) model here: https://github.com/molbal/ComfyUI-GGUF/issues/new?template=request-model-support.md
+
+
+
 ## Installation
 
 > [!IMPORTANT]  
@@ -324,7 +337,18 @@ convolutional factors, and non-LoRA adapter types are rejected.
 
 Imported GGUF LoRAs retain normal dynamic-patch behavior. They are a
 compatibility feature, not an INT8 acceleration: an active LoRA prevents
-`Q8_CR` Linear layers from staying on their native INT8 fast path.
+`Q8_CR` Linear layers from staying on their native INT8 fast path. The
+experimental `Q4_CR_W4A4` path instead fuses the active adapter in full
+precision and re-quantizes the fused weight back into the INT4 ConvRot layout,
+so the native int4 tensor-core kernel stays active while a LoRA/LoKR is
+loaded. The fused, re-quantized weight is cached per patch signature (one
+Hadamard rotate + int4 pack per patch, not per forward); if re-quantization is
+unavailable, it falls back to a dequantized matmul for correctness. Under
+Dynamic VRAM the patch object is recreated each time the model is moved to
+device, so the cache is keyed on the patch's stable content (tensor key plus
+the model-patcher-held patches list identity) rather than the patch object
+identity, ensuring the fused weight is rebuilt only when the adapter actually
+changes.
 
 For a fixed adapter combination, merge the adapters while exporting with
 `tools/convert.py --lora path/to/adapter.safetensors` (repeat `--lora` for

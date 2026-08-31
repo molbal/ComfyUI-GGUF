@@ -1722,10 +1722,12 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         self.assertEqual(quant_conf["backing"], "w4a4")
         self.assertEqual(quant_conf["orig_shape"], [96, 512])
 
-    def test_int4_cr_w4a4_ops_offload_hook_keeps_native_kernel(self):
-        # A DynamicVRAM offload hook is a pure relocate-only weight_function. It must
-        # keep the packed int8 weight and run the native W4A4 kernel (not dequantize
-        # per forward). A real patch that changes values must fall back to dequant.
+    def test_int4_cr_w4a4_ops_empty_patch_keeps_native_kernel(self):
+        # With no weight_function (the normal DynamicVRAM case when no LoRA is active),
+        # the native W4A4 kernel runs and the device-resident QuantizedTensor is cached.
+        # A real patch (LoRA) must never be probed against the packed int8, because a
+        # LoRA adapter swallows its addmm-on-int8 error and silently returns the int8
+        # weight unchanged, which would drop the adapter delta and misroute to native.
         ops = ops_factory()
         lin = ops.Linear(64, 64, bias=True)
         weight2 = torch.randn(64, 512, dtype=torch.float32)
@@ -1751,25 +1753,33 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
 
         x = torch.randn(8, 512, dtype=torch.float32)
 
-        # Relocate-only hook (offload): returns the packed int8 moved to the input device.
-        def relocate(t, *a, **kw):
-            return t.to(device=x.device)
-        lin.weight_function = [relocate]
-        # Force a fresh build (device differs), then confirm it reuses the cache.
-        del lin._quantized_weight
+        # No patch: use the cached QuantizedTensor fast path.
+        lin.weight_function = []
+        lin.bias_function = []
         lin._quantized_weight = None
         lin._quantized_weight_device = None
         out = lin(x)
-        # The offload hook applied to packed int8 should keep int8 shape/dtype, so we
-        # never hit the dequant fallback. Output shape is correct.
         self.assertEqual(out.shape, (8, 64))
-        # The cached QuantizedTensor must now be populated (proves the fast path ran).
         self.assertIsNotNone(lin._quantized_weight)
         self.assertEqual(lin._quantized_weight_device, str(x.device))
 
-    def test_int4_cr_w4a4_ops_real_patch_falls_back_to_dequant(self):
-        # A genuine value-changing patch on the weight must dequantize and use a
-        # full-precision matmul (correctness for LoRA), not run the packed kernel.
+        # A real (value-changing) patch: must be fused and re-quantized so the fast
+        # kernel stays active. The plain (non-fused) QuantizedTensor must NOT be
+        # built, proving we did not fall back to a dequantized matmul.
+        def patch(t, *a, **kw):
+            return t.to(torch.float32) + 1.0
+        lin.weight_function = [patch]
+        lin._quantized_weight = None
+        lin._quantized_weight_device = None
+        out = lin(x)
+        self.assertEqual(out.shape, (8, 64))
+        self.assertIsNone(lin._quantized_weight)
+        self.assertIsNotNone(lin._fused_quantized_weight)
+
+    def test_int4_cr_w4a4_ops_value_patch_keeps_fast_kernel(self):
+        # A genuine value-changing patch on the weight must be fused and re-quantized
+        # back into the ConvRot int4 layout so the fast W4A4 tensor-core kernel stays
+        # active (not a full-precision dequant matmul every forward).
         ops = ops_factory()
         lin = ops.Linear(64, 64, bias=True)
         weight = torch.randn(64, 512, dtype=torch.float32)
@@ -1793,15 +1803,159 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         )
         x = torch.randn(8, 512, dtype=torch.float32)
 
-        # A patch that dequantizes to fp32 (returns a non-int8 tensor) -> must fall back.
+        # A patch that returns fp32 must be fused and re-quantized onto the fast kernel.
         def patch(t, *a, **kw):
             return t.to(torch.float32)
         lin.weight_function = [patch]
         lin._quantized_weight = None
         lin._quantized_weight_device = None
-        # Should not raise (dequant fallback path).
         out = lin(x)
         self.assertEqual(out.shape, (8, 64))
+        self.assertIsNotNone(lin._fused_quantized_weight)
+        self.assertIsNone(lin._quantized_weight)
+
+    def test_int4_cr_w4a4_ops_lora_patch_fused_and_requantized(self):
+        # A real LoRA patch must be applied to the dequantized (full-precision,
+        # un-rotated) weight (so its delta is not silently dropped) and then the fused
+        # weight is re-quantized back into the ConvRot int4 layout so the fast
+        # tensor-core kernel stays active. Before the fix the weight_function was only
+        # probed against the packed int8 and then discarded, so LoRAs produced the
+        # un-patched output (or fell back to a full-precision matmul every forward).
+        ops = ops_factory()
+        lin = ops.Linear(64, 64, bias=True)
+        weight = torch.randn(64, 512, dtype=torch.float32)
+        packed, wscales, quant_conf, orig_shape = quantize_int4_cr_w4a4(
+            weight, convrot_groupsize=256, quant_group_size=64, device=torch.device("cpu")
+        )
+        quant_conf["orig_shape"] = [64, 512]
+        lin._load_from_state_dict(
+            {
+                "weight": packed,
+                "weight_scale": wscales.half(),
+                "comfy_quant": torch.tensor(list(json.dumps(quant_conf).encode("utf-8"))),
+                "bias": torch.randn(64, dtype=torch.float32),
+            },
+            prefix="",
+            local_metadata={},
+            strict=True,
+            missing_keys=[],
+            unexpected_keys=[],
+            error_msgs=[],
+        )
+        self.assertTrue(lin._quantized)
+        x = torch.randn(8, 512, dtype=torch.float32)
+
+        # Low-rank LoRA-style delta encoded as a weight_function.
+        r = 8
+        a = torch.randn(64, r, dtype=torch.float32)
+        b = torch.randn(r, 512, dtype=torch.float32)
+        delta = a @ b
+
+        def lora_patch(t, *args, **kwargs):
+            # Only valid on a full-precision, un-rotated weight of the base shape.
+            self.assertEqual(t.shape, (64, 512))
+            self.assertNotEqual(t.dtype, torch.int8)
+            return t + delta
+
+        lin.weight_function = [lora_patch]
+        lin._quantized_weight = None
+        lin._quantized_weight_device = None
+        # Fusion keeps the fast W4A4 kernel: the fused QuantizedTensor is built, the
+        # plain non-fused QuantizedTensor is not.
+        out = lin(x)
+        self.assertEqual(out.shape, (8, 64))
+        self.assertIsNotNone(lin._fused_quantized_weight)
+        self.assertIsNone(lin._quantized_weight)
+
+        # Reference: apply the same patch to the dequantized weight, re-quantize via the
+        # kitchen layout, and run the same kernel. The fused weight is cached per patch
+        # signature, so the re-quantized reference must match the kernel output exactly.
+        from comfy_kitchen.tensor.convrot_w4a4 import quantize_convrot_w4a4_weight
+        fused = lin._dequantized_weight(torch.device("cpu"), lin._compute_dtype)
+        fused = lora_patch(fused)
+        ref_packed, ref_scales = quantize_convrot_w4a4_weight(
+            fused, convrot_groupsize=256, quant_group_size=64, stochastic_rounding=0
+        )
+        ref_qt = lin._build_fused_quantized_weight(torch.device("cpu"), ref_packed, ref_scales)
+        ref_out = torch.nn.functional.linear(x, ref_qt)
+        ref_bias = lin.bias.to(device=x.device, dtype=x.dtype)
+        if ref_bias is not None:
+            ref_out = ref_out + ref_bias
+        torch.testing.assert_close(out, ref_out, atol=1e-4, rtol=1e-3)
+
+    def test_int4_cr_w4a4_ops_fused_cache_survives_lowvram_patch_rebind(self):
+        # Dynamic VRAM (GGUFModelPatcherDynamic.load) promotes a freshly created
+        # LowVramPatch into weight_function every time the model is moved to device.
+        # That patch object is recreated on each reload, so the fused-weight cache must
+        # NOT be keyed on id(patch_object) — otherwise the expensive Hadamard rotate +
+        # int4 pack runs on every forward (a 12x slowdown measured on large layers).
+        # This test verifies the cache survives patch-object rebinding and only re-fuses
+        # when the underlying patch *content* (key / patches dict) actually changes.
+        ops = ops_factory()
+        lin = ops.Linear(64, 64, bias=True)
+        weight = torch.randn(64, 512, dtype=torch.float32)
+        packed, wscales, quant_conf, orig_shape = quantize_int4_cr_w4a4(
+            weight, convrot_groupsize=256, quant_group_size=64, device=torch.device("cpu")
+        )
+        quant_conf["orig_shape"] = [64, 512]
+        lin._load_from_state_dict(
+            {
+                "weight": packed,
+                "weight_scale": wscales.half(),
+                "comfy_quant": torch.tensor(list(json.dumps(quant_conf).encode("utf-8"))),
+                "bias": torch.randn(64, dtype=torch.float32),
+            },
+            prefix="",
+            local_metadata={},
+            strict=True,
+            missing_keys=[],
+            unexpected_keys=[],
+            error_msgs=[],
+        )
+        self.assertTrue(lin._quantized)
+        x = torch.randn(8, 512, dtype=torch.float32)
+
+        # Mimic comfy.model_patcher.LowVramPatch: an object with is_lowvram_patch,
+        # a stable tensor key, and a pointer to the model-patcher-held patches dict.
+        class FakeLowVramPatch:
+            is_lowvram_patch = True
+            def __init__(self, key, patches):
+                self.key = key
+                self.patches = patches
+                self.prepared_patches = None
+            def __call__(self, weight):
+                # A genuine value-changing adapter, so it must fuse.
+                return weight + 0.1
+
+        # The dict/list live on the model patcher and persist across reloads.
+        key = "blocks.1.weight"
+        patches = {key: [(1.0, torch.full((64, 512), 0.5), 1.0, None, None)]}
+
+        # First forward builds the fused weight.
+        lin.weight_function = [FakeLowVramPatch(key, patches)]
+        out = lin(x)
+        self.assertEqual(out.shape, (8, 64))
+        self.assertIsNotNone(lin._fused_quantized_weight)
+        first_id = id(lin._fused_quantized_weight)
+        sig1 = lin._fused_patch_signature()
+
+        # Simulate repeated DynamicVRAM reloads: a NEW patch object each forward, but
+        # the same underlying patches dict/list (which persists on the model patcher).
+        for _ in range(3):
+            lin.weight_function = [FakeLowVramPatch(key, patches)]
+            out = lin(x)
+        self.assertEqual(out.shape, (8, 64))
+        # The cache must have been reused (same fused-QuantizedTensor, same signature).
+        self.assertEqual(id(lin._fused_quantized_weight), first_id)
+        self.assertEqual(lin._fused_patch_signature(), sig1)
+
+        # A real patch change (new patches dict → new list) must invalidate the cache.
+        changed_patches = {key: [(1.0, torch.full((64, 512), 0.25), 1.0, None, None)]}
+        lin.weight_function = [FakeLowVramPatch(key, changed_patches)]
+        out = lin(x)
+        self.assertEqual(out.shape, (8, 64))
+        self.assertIsNotNone(lin._fused_quantized_weight)
+        self.assertNotEqual(lin._fused_patch_signature(), sig1)
 
 
 if __name__ == "__main__":
