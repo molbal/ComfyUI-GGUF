@@ -130,21 +130,6 @@ For the portable Windows distribution, use its embedded Python executable:
   --quantization-device auto
 ```
 
-### Optional quantized-layer performance log
-
-Set `COMFYUI_GGUF_PERF_LOG` before starting ComfyUI to write native INT8 and
-ConvRot INT4 Linear timings to a separate file. Its value is the log path:
-
-```powershell
-$env:COMFYUI_GGUF_PERF_LOG = 'C:\Temp\comfyui-gguf-performance.log'
-python main.py
-```
-
-Using `1`, `true`, `yes`, or `on` writes `comfyui-gguf-performance.log` in the
-current directory. Timings synchronize CUDA only for this diagnostic mode.
-INT4 LoRA fusion is completed during model loading; compare forward calls with
-the same workflow when checking steady-state INT4 versus INT8 performance.
-
 ### Local conversion dashboard
 
 For a local browser UI that queues conversions and shows the converter's live
