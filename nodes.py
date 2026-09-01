@@ -5,6 +5,8 @@ import inspect
 import collections
 import json
 import os
+from contextlib import nullcontext
+from tqdm import tqdm
 
 import nodes
 import comfy.sd
@@ -94,7 +96,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         """Prepare all active INT4 adapter fusions before the model is used."""
         prepared = []
         layout = []
-        modules = []
+        active_modules = []
         for name, module in self.model.named_modules():
             signature = getattr(module, "_fused_patch_signature", None)
             prepare = getattr(module, "prepare_fused_weight", None)
@@ -102,7 +104,8 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 continue
             module_signature = signature()
             layout.append((name, module_signature))
-            modules.append((module, module_signature))
+            if getattr(module, "weight_function", ()) or getattr(module, "bias_function", ()):
+                active_modules.append((name, module))
 
         layout = tuple(layout)
         previous_layout = getattr(self, "_gguf_patch_layout_signature", None)
@@ -111,10 +114,41 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         self._gguf_patch_layout_signature = layout
 
         if device is None:
+            # Fusion is a compute-heavy operation.  Use the device where the
+            # model will execute rather than the offload device, which is
+            # commonly CPU for Dynamic VRAM models.  The latter remains the
+            # fallback for older/custom patchers that do not expose a load
+            # device.
+            device = getattr(self, "load_device", None)
+        if device is None:
             device = getattr(self, "offload_device", None)
-        for module, _ in modules:
-            if module.prepare_fused_weight(device):
-                prepared.append(module)
+        device = torch.device(device) if device is not None else torch.device("cpu")
+        if not active_modules:
+            return 0
+
+        interrupt = getattr(comfy.model_management, "throw_exception_if_processing_interrupted", None)
+        cuda_context = getattr(comfy.model_management, "cuda_device_context", None)
+        device_context = cuda_context(device) if callable(cuda_context) else nullcontext()
+        try:
+            with device_context:
+                with tqdm(
+                    total=len(active_modules),
+                    desc=f"Fusing INT4 LoRA ({device})",
+                    unit="layer",
+                    dynamic_ncols=True,
+                ) as progress:
+                    for name, module in active_modules:
+                        if interrupt is not None:
+                            interrupt()
+                        progress.set_postfix_str(name, refresh=False)
+                        if module.prepare_fused_weight(device):
+                            prepared.append(module)
+                        progress.update(1)
+        except BaseException:
+            # Do not leave a mixture of old and newly fused representations after
+            # an interrupt or a failed adapter preparation.
+            self._evict_gguf_quantized_caches()
+            raise
         return len(prepared)
 
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False):

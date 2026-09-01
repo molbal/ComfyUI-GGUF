@@ -73,6 +73,36 @@ def ops_factory():
     return module.get_gguf_q4_w4a4_ops(torch.bfloat16)
 
 
+def nodes_factory():
+    """Load the repo's nodes.py without requiring ComfyUI to load this plugin."""
+    import sys
+
+    nodes_path = Path(__file__).parents[1] / "nodes.py"
+    repository_path = nodes_path.parent.resolve()
+    original_sys_path = sys.path[:]
+    sys.path = [path for path in sys.path if Path(path).resolve() != repository_path]
+    package_name = "comfyui_gguf_nodes_test"
+    try:
+        package = sys.modules.get(package_name)
+        if package is None:
+            package = importlib.util.module_from_spec(
+                importlib.util.spec_from_loader(package_name, loader=None)
+            )
+            package.__path__ = [str(nodes_path.parent)]
+            sys.modules[package_name] = package
+        spec = importlib.util.spec_from_file_location(
+            f"{package_name}.nodes",
+            nodes_path,
+            submodule_search_locations=[str(nodes_path.parent)],
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path = original_sys_path
+
+
 class TargetSizeQuantizationTests(unittest.TestCase):
     def setUp(self):
         self.model_arch = ModelTemplate()
@@ -2008,6 +2038,54 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         self.assertEqual(out.shape, (8, 64))
         self.assertIsNotNone(lin._fused_quantized_weight)
         self.assertNotEqual(lin._fused_patch_signature(), sig1)
+
+    def test_int4_lora_fusion_defaults_to_execution_device(self):
+        nodes_module = nodes_factory()
+        calls = []
+
+        class Progress:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def set_postfix_str(self, *args, **kwargs):
+                pass
+
+            def update(self, *args, **kwargs):
+                pass
+
+        modules = [
+            type(
+                "FakeQuantizedLayer",
+                (),
+                {
+                    "weight_function": [object()],
+                    "bias_function": [],
+                    "_fused_patch_signature": lambda self: ("patch",),
+                    "prepare_fused_weight": lambda self, device: calls.append(device) or True,
+                },
+            )()
+        ]
+        patcher = type(
+            "FakePatcher",
+            (),
+            {
+                "model": type("FakeModel", (), {"named_modules": lambda self: [("layer", modules[0])]} )(),
+                "load_device": torch.device("cuda:0"),
+                "offload_device": torch.device("cpu"),
+                "_gguf_patch_layout_signature": None,
+            },
+        )()
+
+        with mock.patch.object(nodes_module, "tqdm", return_value=Progress()), \
+                mock.patch.object(nodes_module.comfy.model_management, "cuda_device_context", return_value=Progress()), \
+                mock.patch.object(nodes_module.comfy.model_management, "throw_exception_if_processing_interrupted", None):
+            prepared = nodes_module.GGUFModelPatcher._prepare_gguf_quantized_weights(patcher)
+
+        self.assertEqual(prepared, 1)
+        self.assertEqual(calls, [torch.device("cuda:0")])
 
     def test_performance_log_records_quantized_forward(self):
         import sys

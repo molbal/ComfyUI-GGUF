@@ -16,11 +16,9 @@ _PERF_LOG_ENV = "COMFYUI_GGUF_PERF_LOG"
 
 
 def _configure_perf_logger():
-    # log_path = os.environ.get(_PERF_LOG_ENV)
-    # if not log_path:
-#         return None
-    # if log_path.strip().lower() in {"1", "true", "yes", "on"}:
-    log_path = "comfyui-gguf-performance.log"
+    log_path = os.environ.get(_PERF_LOG_ENV, "comfyui-gguf-performance.log")
+    if log_path.strip().lower() in {"1", "true", "yes", "on"}:
+        log_path = "comfyui-gguf-performance.log"
 
     logger = logging.getLogger("comfyui_gguf.performance")
     logger.setLevel(logging.INFO)
