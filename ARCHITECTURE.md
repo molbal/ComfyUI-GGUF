@@ -1,0 +1,61 @@
+# ComfyUI-GGUF Architecture & Technical Details
+
+This document covers the engineering details behind ComfyUI-GGUF, including the custom `Q8_CR` native INT8 layout, target-size quantization fallback algorithms, dynamic patch behavior, and the dequantization cache utilized for LoRA exports.
+
+## Native Weight-Only Quantization (Q8_CR)
+
+The converter supports one custom global quantization mode tailored for DiT/transformer UNets called `Q8_CR`. This is an INT8 weight-only format designed to reduce GGUF model storage and VRAM pressure while preserving the fast native INT8 Linear operations available on supported NVIDIA GPUs. It prevents severe VRAM bottlenecks when ComfyUI needs to offload weights to CPU memory.
+
+During conversion, the quantization pipeline performs the following sequence:
+1. Selects eligible 2-D Linear weights while intentionally excluding one-dimensional tensors, small tensors, architecture-designated sensitive tensors, and Conv2d weights to maintain FP32/FP16 precision where required.
+2. Applies the compatible ConvRot/Hadamard rotation to each eligible weight matrix.
+3. Quantizes the rotated weights to INT8 using an FP32 scale for every output row.
+4. Stores the INT8 payload, row scales, and ConvRot metadata directly in the compiled GGUF file.
+
+`Q8_CR` conversion accepts `--quantization-device auto`, `cpu`, or `cuda`. The `auto` flag prioritizes CUDA. If a matrix cannot fit in free VRAM, the converter logs a CPU fallback for that specific matrix without altering the overall output format. 
+
+During load time, the GGUF loader reads the specialized metadata and passes the raw INT8 weights and row scales to ComfyUI's `TensorWiseINT8Layout`. On CUDA systems, ComfyUI natively executes the INT8/ConvRot Linear path directly without expanding the weight matrix to FP16.
+
+### Q8_CR Platform Support
+
+Q8_CR execution operates through ComfyUI's `comfy_kitchen` layout backend:
+* NVIDIA CUDA triggers ComfyUI's optimized native INT8 backend automatically.
+* Linux environments utilize the eager backend when CUDA is unavailable.
+* Non-CUDA systems rely on the `comfy_kitchen` eager backend fallback.
+* CPU Q8_CR loading and inference are fully supported but execute slower than hardware-accelerated CUDA passes.
+
+### Maintainer Recommendation for NVIDIA RTX 30-Series
+
+For Krea 2 and Ideogram 4 models on RTX 30-series architecture, `Q8_CR` offers significant benefits:
+* Fast native INT8 operations routed through ComfyUI's ConvRot backend.
+* Convenient CPU offload and memory-mapped model storage via the GGUF container.
+* High image fidelity expected from 8-bit quantization while shielding sensitive tensors.
+* Reduced VRAM pressure during complex multi-model spatial workflows.
+
+## Target-Size Quantization Algorithm
+
+Developers can utilize `tools/convert.py --max-size-mb <MiB>` to mandate the best supported mixed quantization below a strict output size ceiling. 
+
+The fallback logic operates as follows:
+1. Core 2-D Linear weights default to native INT8 ConvRot (`Q8_CR`), preserving all protected tensors in FP32.
+2. Matrices closest to the model's core center drop to `Q5_0`.
+3. If further reduction is required, those core matrices drop to `Q4_0`.
+4. If the target size is still unmet after all core matrices reach `Q4_0`, standard 1-D tensors are reduced to BF16 (protected architecture tensors strictly remain FP32).
+
+`Q4_0` acts as the hard floor for core quantization. If a specified target falls below this theoretical minimum, the converter throws an error reporting the minimum achievable size. 
+
+## LoRAs and Fused GGUF Exports
+
+**Load LoRA (GGUF)** integrates standard GGUF adapters directly into ComfyUI's patch mechanism. It natively parses `general.type=adapter` and `adapter.type=lora` alongside `.lora_a`/`.lora_b` tensors in F32, F16, BF16, or Q8_0.
+
+Imported GGUF LoRAs retain normal dynamic-patch behavior to ensure maximum compatibility. Because of this, an active LoRA prevents `Q8_CR` Linear layers from utilizing their native INT8 fast path. 
+
+The experimental `Q4_CR_W4A4` pipeline addresses this by utilizing a dequantization cache:
+1. It dequantizes the active adapter target dynamically.
+2. It applies the adapter mathematically within the designated compute dtype.
+3. It caches the patched floating-point weight in memory while the model remains loaded.
+4. It evicts the derived quantized caches automatically when the underlying model or LoRA patch layout changes.
+
+Retaining the patched weight in floating-point memory is mandatory because minor LoRA deltas evaporate mathematically if an already-quantized matrix undergoes re-quantization back to INT4. 
+
+For fixed adapter combinations, developers should merge adapters statically during export. Running `tools/convert.py --lora path/to/adapter.safetensors` fuses the parameters prior to quantization. Using the **Targeted Quantization (GGUF)** node's `streamed` input flag reads, fuses, quantizes, and stages one tensor block at a time to aggressively minimize peak RAM consumption.

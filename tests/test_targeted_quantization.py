@@ -2033,6 +2033,72 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         self.assertIsNone(lin._fused_weight)
         self.assertIsNotNone(lin._quantized_weight)
 
+    def test_int4_cr_w4a4_ops_lokr_uses_native_base_and_residual(self):
+        from comfy.weight_adapter.lokr import LoKrAdapter
+
+        ops = ops_factory()
+        lin = ops.Linear(64, 64, bias=True)
+        weight = torch.randn(64, 512, dtype=torch.float32)
+        packed, wscales, quant_conf, orig_shape = quantize_int4_cr_w4a4(
+            weight, convrot_groupsize=256, quant_group_size=64, device=torch.device("cpu")
+        )
+        quant_conf["orig_shape"] = [64, 512]
+        lin._load_from_state_dict(
+            {
+                "weight": packed,
+                "weight_scale": wscales.half(),
+                "comfy_quant": torch.tensor(list(json.dumps(quant_conf).encode("utf-8"))),
+                "bias": torch.randn(64, dtype=torch.float32),
+            },
+            prefix="",
+            local_metadata={},
+            strict=True,
+            missing_keys=[],
+            unexpected_keys=[],
+            error_msgs=[],
+        )
+
+        # This matches the direct lokr_w1/lokr_w2 layout used by the Krea2 LoKr
+        # adapter. Keep the factors on CPU, as they are after normal LoRA loading.
+        w1 = torch.randn(8, 8, dtype=torch.float32)
+        w2 = torch.randn(8, 64, dtype=torch.float32)
+        adapter = LoKrAdapter(
+            set(), (w1, w2, None, None, None, None, None, None, None)
+        )
+        key = "blocks.1.weight"
+        patches = {key: [(0.75, adapter, 1.0, None, None)]}
+
+        class FakeLowVramPatch:
+            is_lowvram_patch = True
+
+            def __init__(self, key, patches):
+                self.key = key
+                self.patches = patches
+                self.prepared_patches = None
+
+            def __call__(self, value):
+                return value
+
+        x = torch.randn(8, 512, dtype=torch.float32)
+        base_out = lin(x)
+        lin.weight_function = [FakeLowVramPatch(key, patches)]
+
+        self.assertIsNotNone(lin._native_lora_patch_entries())
+        self.assertFalse(lin.prepare_fused_weight(torch.device("cpu")))
+        with mock.patch.object(
+            lin, "_get_cached_fused_weight", side_effect=AssertionError("LoKr fallback")
+        ):
+            out = lin(x)
+
+        expected = base_out + 0.75 * torch.nn.functional.linear(
+            x, torch.kron(w1, w2)
+        )
+        torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-3)
+        self.assertEqual(w1.device, torch.device("cpu"))
+        self.assertEqual(w2.device, torch.device("cpu"))
+        self.assertIsNone(lin._fused_weight)
+        self.assertIsNotNone(lin._quantized_weight)
+
     def test_int4_cr_w4a4_ops_fused_cache_survives_lowvram_patch_rebind(self):
         # Dynamic VRAM (GGUFModelPatcherDynamic.load) promotes a freshly created
         # LowVramPatch into weight_function every time the model is moved to device.

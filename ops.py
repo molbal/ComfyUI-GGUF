@@ -1,4 +1,5 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
+import copy
 import gguf
 import json
 import torch
@@ -884,14 +885,20 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                             torch.nn.functional.linear(input, down), up
                         ) * scale
                     else:
-                        # LoKr's h() is already a low-rank/Kronecker matmul, but
-                        # its legacy implementation expects factors on input.device.
-                        if any(
-                            isinstance(weight, torch.Tensor) and weight.device != input.device
+                        # LoKr's h() is already a low-rank/Kronecker matmul. Its
+                        # implementation casts factors to the input dtype but does
+                        # not move them to the input device, so use a shallow,
+                        # device-local adapter view instead of mutating the
+                        # persistent CPU/offload adapter.
+                        local_adapter = copy.copy(adapter)
+                        local_adapter.weights = tuple(
+                            comfy.model_management.cast_to_device(
+                                weight, input.device, input.dtype
+                            )
+                            if isinstance(weight, torch.Tensor) else weight
                             for weight in getattr(adapter, "weights", ())
-                        ):
-                            return None
-                        delta = adapter.h(input, base_out)
+                        )
+                        delta = local_adapter.h(input, base_out)
                     out = out + strength * delta
                 return out
 
