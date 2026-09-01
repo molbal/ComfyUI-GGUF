@@ -293,7 +293,7 @@ class UnetLoaderGGUF:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_unet"
     CATEGORY = "bootleg"
-    TITLE = "Unet Loader (GGUF)"
+    TITLE = "Unet Loader (GGUF, Legacy node)"
 
     def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None):
         unet_path = folder_paths.get_full_path("unet", unet_name)
@@ -361,7 +361,7 @@ class VAELoaderGGUF:
     RETURN_TYPES = ("VAE",)
     FUNCTION = "load_vae"
     CATEGORY = "bootleg"
-    TITLE = "VAE Loader (GGUF)"
+    TITLE = "VAE Loader (GGUF, Legacy node)"
 
     def load_vae(self, vae_name):
         vae_path = folder_paths.get_full_path("vae", vae_name)
@@ -855,7 +855,7 @@ class GGUFModelPatcherDynamic(comfy.model_patcher.ModelPatcherDynamic):
 
 
 class UnetLoaderGGUFDynamicVRAM(UnetLoaderGGUF):
-    TITLE = "Unet Loader (Dynamic VRAM)"
+    TITLE = "Unet Loader (GGUF, Dynamic VRAM)"
 
     def load_unet(self, unet_name, **kwargs):
         unet_path = folder_paths.get_full_path("unet", unet_name)
@@ -889,7 +889,7 @@ class CLIPLoaderGGUF:
     RETURN_TYPES = ("CLIP",)
     FUNCTION = "load_clip"
     CATEGORY = "bootleg"
-    TITLE = "CLIPLoader (GGUF)"
+    TITLE = "CLIPLoader (GGUF, Legacy node)"
 
     @classmethod
     def get_filename_list(s):
@@ -980,7 +980,7 @@ def _load_dynamic_gguf_clip_patcher(clip_paths, clip_type, disable_dynamic=False
 
 
 class CLIPLoaderGGUFDynamicVRAM(CLIPLoaderGGUF):
-    TITLE = "CLIPLoader (Dynamic VRAM)"
+    TITLE = "CLIPLoader (GGUF, Dynamic VRAM)"
 
     def load_clip(self, clip_name, type="stable_diffusion"):
         clip_path = folder_paths.get_full_path("clip", clip_name)
@@ -1000,7 +1000,7 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
             }
         }
 
-    TITLE = "DualCLIPLoader (GGUF)"
+    TITLE = "DualCLIPLoader (GGUF, Legacy node)"
 
     def load_clip(self, clip_name1, clip_name2, type):
         clip_path1 = folder_paths.get_full_path("clip", clip_name1)
@@ -1011,7 +1011,7 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
 
 
 class DualCLIPLoaderGGUFDynamicVRAM(DualCLIPLoaderGGUF):
-    TITLE = "DualCLIPLoader (Dynamic VRAM)"
+    TITLE = "DualCLIPLoader (GGUF, Dynamic VRAM)"
 
     def load_clip(self, clip_name1, clip_name2, type):
         clip_paths = (
@@ -1033,7 +1033,7 @@ class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
             }
         }
 
-    TITLE = "TripleCLIPLoader (GGUF)"
+    TITLE = "TripleCLIPLoader (GGUF, Legacy node)"
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, type="sd3"):
         clip_path1 = folder_paths.get_full_path("clip", clip_name1)
@@ -1045,7 +1045,7 @@ class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
 
 
 class TripleCLIPLoaderGGUFDynamicVRAM(TripleCLIPLoaderGGUF):
-    TITLE = "TripleCLIPLoader (Dynamic VRAM)"
+    TITLE = "TripleCLIPLoader (GGUF, Dynamic VRAM)"
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, type="sd3"):
         clip_paths = (
@@ -1069,7 +1069,7 @@ class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
         }
     }
 
-    TITLE = "QuadrupleCLIPLoader (GGUF)"
+    TITLE = "QuadrupleCLIPLoader (GGUF, Legacy node)"
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, clip_name4, type="stable_diffusion"):
         clip_path1 = folder_paths.get_full_path("clip", clip_name1)
@@ -1082,7 +1082,7 @@ class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
 
 
 class QuadrupleCLIPLoaderGGUFDynamicVRAM(QuadrupleCLIPLoaderGGUF):
-    TITLE = "QuadrupleCLIPLoader (Dynamic VRAM)"
+    TITLE = "QuadrupleCLIPLoader (GGUF, Dynamic VRAM)"
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, clip_name4, type="stable_diffusion"):
         clip_paths = (
