@@ -353,22 +353,28 @@ convolutional factors, and non-LoRA adapter types are rejected.
 Imported GGUF LoRAs retain normal dynamic-patch behavior. They are a
 compatibility feature, not an INT8 acceleration: an active LoRA prevents
 `Q8_CR` Linear layers from staying on their native INT8 fast path. The
-experimental `Q4_CR_W4A4` path instead fuses the active adapter in full
-precision and re-quantizes the fused weight back into the INT4 ConvRot layout,
-so the native int4 tensor-core kernel stays active while a LoRA/LoKR is
-loaded. The fused, re-quantized weights are prepared while the model is loaded,
-so the Hadamard rotate + int4 pack cost is not paid during sampling. Only the
-active fused representation is retained for each layer; if re-quantization is
-unavailable, that layer falls back to a dequantized matmul for correctness.
+experimental `Q4_CR_W4A4` path instead dequantizes the active adapter target,
+applies the adapter in the compute dtype, and caches that patched floating-point
+weight while the model is loaded. Keeping the patched weight in floating point
+is required because small LoRA deltas can disappear when an already-quantized
+matrix is re-quantized to INT4. The pristine no-LoRA path remains native INT4;
+standard LoRA and LoKr layers instead keep the native INT4 base matmul and add
+their low-rank output correction without expanding the complete weight. Other
+patch forms use the cached floating-point matmul for correctness. Only the
+active derived representation is retained for each layer, and layout changes
+evict it before a new one is prepared.
 When a model or LoRA patch layout changes, all derived quantized caches are
 evicted before the new active representation is prepared. Loading an active
 INT4 adapter displays a console progress bar for this per-layer preparation;
-the bar is absent for the pristine no-LoRA path. Preparation uses the model's
-execution device when available, so CUDA-capable systems perform the expensive
-dequantize, LoRA, Hadamard, and INT4-pack work on GPU; CPU remains the fallback
-when no execution device is exposed. Fusion is serial and the resulting cache
-is still managed by the normal Dynamic VRAM eviction/movement lifecycle, but
-the temporary workspace for the layer being fused must fit in available VRAM.
+the bar is absent for the pristine no-LoRA path and completes without full-weight
+fusion for supported standard LoRA/LoKr patches. Fallback preparation uses the
+model's execution device when available, so CUDA-capable systems perform the
+expensive dequantize and LoRA application on GPU; CPU remains the fallback when
+no execution device is exposed. Each completed fallback weight is staged back
+to the offload device, and each forward uses only a temporary execution-device
+copy; the persistent fused cache is not promoted when another layer runs.
+Fallback fusion is serial, and the temporary workspace for the layer being
+fused must fit in available VRAM.
 
 For a fixed adapter combination, merge the adapters while exporting with
 `tools/convert.py --lora path/to/adapter.safetensors` (repeat `--lora` for

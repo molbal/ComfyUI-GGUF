@@ -143,6 +143,14 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                         progress.set_postfix_str(name, refresh=False)
                         if module.prepare_fused_weight(device):
                             prepared.append(module)
+                            # Patched INT4 layers retain a full-precision matrix for
+                            # correctness. Stage each completed matrix back to the
+                            # offload device so all 256 layers do not accumulate on
+                            # the execution GPU during model loading.
+                            move = getattr(module, "move_fused_caches", None)
+                            offload_device = getattr(self, "offload_device", None)
+                            if move is not None and offload_device is not None and device != offload_device:
+                                move(offload_device)
                         progress.update(1)
         except BaseException:
             # Do not leave a mixture of old and newly fused representations after
