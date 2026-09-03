@@ -50,7 +50,11 @@ The fallback logic operates as follows:
 
 Imported GGUF LoRAs retain normal dynamic-patch behavior to ensure maximum compatibility. Because of this, an active LoRA prevents `Q8_CR` Linear layers from utilizing their native INT8 fast path. 
 
-For `Q4_CR_W4A4`, compatible standard LoRA and LoKr patches keep the packed INT4 base and add an exact low-rank output correction. They do not fuse or cache a full floating-point weight. Other patch forms that cannot use this bypass fall back to a compute-dtype cache:
+For `Q4_CR_W4A4`, compatible standard LoRA and LoKr patches keep the packed
+INT4 base and add an exact BF16 low-rank output correction on every platform.
+They do not fuse or cache a full patched weight.
+
+Other patch forms that cannot use either compatible LoRA/LoKr route fall back to a compute-dtype cache:
 1. It dequantizes the target and applies the patch in the compute dtype.
 2. It caches the resulting patched floating-point weight while the model remains loaded.
 3. It evicts the derived caches when the model or patch layout changes.
@@ -61,6 +65,14 @@ there, and only the completed output is copied back to the execution device. Thi
 reduces the transient CUDA peak but cannot avoid the final output allocation needed
 by the following GPU layer.
 
-The fallback cache remains floating-point because re-quantizing a patched matrix to INT4 can erase small deltas. Compatible standard LoRA and LoKr avoid that cache through their low-rank bypass.
+The fallback cache remains floating-point because re-quantizing a patched matrix to INT4 can erase small deltas. Unsupported patch forms and CUDA OOM retries retain the existing floating-point fallback behavior.
+
+### Performance Diagnostics
+
+Performance logging is off unless `COMFYUI_GGUF_PERF_LOG` is set to `1`, a
+truthy value, or a log path. It synchronizes CUDA before and after every
+quantized Linear to produce per-layer wall-clock timings. This intentionally
+serializes work and is unsuitable for normal inference or comparative
+throughput benchmarks.
 
 For fixed adapter combinations, developers should merge adapters statically during export. Running `tools/convert.py --lora path/to/adapter.safetensors` fuses the parameters prior to quantization. Using the **Targeted Quantization (GGUF)** node's `streamed` input flag reads, fuses, quantizes, and stages one tensor block at a time to aggressively minimize peak RAM consumption.

@@ -2991,6 +2991,16 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         self.assertIn("elapsed_ms=", contents)
         self.assertIn("input_shape=(2, 16)", contents)
 
+    def test_performance_log_is_opt_in(self):
+        import sys
+
+        ops_factory()
+        ops_module = sys.modules["comfyui_gguf_test.ops"]
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(ops_module._configure_perf_logger())
+        with mock.patch.dict(os.environ, {ops_module._PERF_LOG_ENV: ""}):
+            self.assertIsNone(ops_module._configure_perf_logger())
+
 
 if __name__ == "__main__":
     unittest.main()
