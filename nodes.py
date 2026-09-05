@@ -163,6 +163,28 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         weight = comfy.utils.get_attr(self.model, key)
 
         patches = self.patches[key]
+        # Legacy Q4_CR (INT4) path: the base weight stays packed (plain
+        # Parameter) and adapters run through the module's weight_function
+        # (native low-rank bypass or fused fallback). Fusing directly with
+        # calculate_weight here would corrupt the packed INT4 bytes.
+        # Standard GGML quants and all other tensors keep their paths below
+        # unchanged.
+        if key.rsplit('.', 1)[-1] == "weight" and '.' in key:
+            module = None
+            try:
+                module = comfy.utils.get_attr(self.model, key.rsplit('.', 1)[0])
+            except Exception:
+                module = None
+            install_patch = getattr(module, "install_patch_entries", None)
+            if install_patch is not None and bool(getattr(module, "_quantized", False)):
+                out_weight = weight.to(device_to)
+                patches = move_patch_to_device(patches, self.load_device if self.patch_on_device else self.offload_device)
+                install_patch(patches, key)
+                if inplace_update:
+                    comfy.utils.copy_to_param(self.model, key, out_weight)
+                else:
+                    comfy.utils.set_attr_param(self.model, key, out_weight)
+                return
         if is_quantized(weight):
             out_weight = weight.to(device_to)
             patches = move_patch_to_device(patches, self.load_device if self.patch_on_device else self.offload_device)
