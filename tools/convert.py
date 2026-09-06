@@ -3,6 +3,7 @@ import os
 import math
 import gguf
 import json
+import numpy as np
 import torch
 import logging
 import argparse
@@ -31,6 +32,7 @@ _FP8_DTYPES = {
     getattr(torch, "float8_e4m3fn", None),
     getattr(torch, "float8_e5m2", None),
 } - {None}
+RAW_BYTE_TENSOR_KEYS = frozenset(("tokenizer_json", "spiece_model", "tekken_model"))
 
 class ModelTemplate:
     arch = "invalid"  # string describing architecture
@@ -482,6 +484,13 @@ def _default_qtype(data_or_dtype):
     )
 
 
+def _is_raw_byte_tensor(key, data_or_dtype, ndim=None):
+    dtype = getattr(data_or_dtype, "dtype", data_or_dtype)
+    if ndim is None:
+        ndim = len(data_or_dtype.shape)
+    return key in RAW_BYTE_TENSOR_KEYS and ndim == 1 and dtype in (torch.uint8, torch.int8)
+
+
 def _is_target_core_tensor(key, data, model_arch):
     if len(data.shape) != 2:
         return False
@@ -535,7 +544,11 @@ def plan_target_size_quantization(
             continue
 
         n_params = data.numel()
-        if len(data.shape) == 1 or n_params <= QUANTIZATION_THRESHOLD or key_matches(key, model_arch.keys_hiprec):
+        if _is_raw_byte_tensor(key, data):
+            # GGUF has no U8 tensor type. I8 is used as a byte container and
+            # the loader restores the unsigned view without changing bits.
+            plan[key] = gguf.GGMLQuantizationType.I8
+        elif len(data.shape) == 1 or n_params <= QUANTIZATION_THRESHOLD or key_matches(key, model_arch.keys_hiprec):
             plan[key] = gguf.GGMLQuantizationType.F32
             if len(data.shape) == 1 and not key_matches(key, model_arch.keys_hiprec):
                 one_dimensional_tensors.append((key, data))
@@ -557,7 +570,7 @@ def plan_target_size_quantization(
                 continue
             qtype = plan[key]
             total += _tensor_size_bytes(data.shape, qtype)
-            if qtype == gguf.GGMLQuantizationType.I8:
+            if qtype == gguf.GGMLQuantizationType.I8 and not _is_raw_byte_tensor(key, data):
                 # Q8_CR stores a F32 scale for every output row.
                 total += data.shape[0] * 4
         return total
@@ -1038,7 +1051,13 @@ def handle_tensors(
             or old_dtype in (torch.float32, torch.bfloat16)
             or old_dtype in _FP8_DTYPES
         )
-        if quantization_plan is not None and key in quantization_plan:
+        raw_byte_tensor = _is_raw_byte_tensor(key, old_dtype, n_dims)
+        if raw_byte_tensor:
+            data_qtype = gguf.GGMLQuantizationType.I8
+            # GGUF exposes only signed I8, but the payload is intentionally
+            # reinterpreted rather than converted so bytes >= 128 survive.
+            data = np.ascontiguousarray(data).view(np.int8)
+        elif quantization_plan is not None and key in quantization_plan:
             data_qtype = quantization_plan[key]
         elif apply_quantization_rules:
             if n_dims == 1:
@@ -1090,8 +1109,21 @@ def handle_tensors(
             )
             and not key_matches(key, model_arch.keys_hiprec)
             and not key_matches(key, model_arch.keys_noquant)
+            and not raw_byte_tensor
         ):
             data_qtype = gguf.GGMLQuantizationType.F16
+
+        if raw_byte_tensor:
+            if verbose:
+                tqdm.write(
+                    f"{f'%-{max_name_len + 4}s' % key} "
+                    f"{old_dtype} --> {data_qtype.name}, shape = "
+                    f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
+                )
+            writer.add_tensor(key, data, raw_dtype=data_qtype)
+            if progress_callback is not None:
+                progress_callback("quantize", progress_offset + tensor_index, progress_total or len(state_dict))
+            continue
 
         # Q8_CR is the supported custom quantization path.
         if (

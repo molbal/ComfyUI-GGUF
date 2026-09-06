@@ -53,6 +53,8 @@ Initial support for quantizing T5 has also been added recently, these can be use
 - [Qwen3-VL-32B-Instruct-MiniMax-H3 pruned GGUFs](https://huggingface.co/nif0/Qwen3-VL-32B-Instruct-MiniMax-H3-GGUF) 🍴  
 - [Qwen3.5 GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) text encoders (0.8B, 2B, 4B, 9B, and 27B) with a ComfyUI build containing Qwen3.5 TE support. Place the matching `mmproj-*.gguf` beside the text encoder for image conditioning; text-only workflows do not need it. 🍴  
 - [Gemma 4 GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF) text encoders (E2B, E4B, 12B, and 31B) with ComfyUI v0.30.0 or later. 🍴
+
+MiniMax Music 3 text-encoder conversions preserve `tokenizer_json` as raw bytes. The GGUF CLIP loaders also normalize older files that stored this payload as `F32`, so both legacy and newly converted files can be loaded by ComfyUI's tokenizer.
   
 
 ## Converting Models (Krea 2, Ideogram 4, MiniMax H3, MiniMax Music 3)

@@ -15,6 +15,7 @@ from .quant_ops import make_quantized
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "ltxv_upscaler", "hyvid", "wan", "lumina2", "qwen_image", "ideogram", "krea2", "minimax_h3", "minimax_h3_vae", "minimax_music3"}
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "qwen35", "gemma3", "gemma4", "minimax_music3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
+RAW_BYTE_TENSOR_KEYS = frozenset(("tokenizer_json", "spiece_model", "tekken_model"))
 
 def device_supports_bf16():
     """
@@ -111,6 +112,24 @@ def get_gguf_metadata(reader):
 
 def gguf_tensor_count(path):
     return len(gguf.GGUFReader(path).tensors)
+
+
+def normalize_raw_byte_tensor(value):
+    """Restore tokenizer payloads to the uint8 contract expected by ComfyUI."""
+    if isinstance(value, GGMLTensor):
+        qtype = getattr(value, "tensor_type", None)
+        if qtype == gguf.GGMLQuantizationType.I8:
+            return value.data.view(torch.uint8).reshape(value.tensor_shape).contiguous()
+        if is_quantized(value):
+            value = dequantize_tensor(value, dtype=torch.float32)
+        else:
+            value = torch.Tensor(value).reshape(value.tensor_shape)
+    elif hasattr(value, "dequantize"):
+        value = value.dequantize()
+
+    if not torch.is_tensor(value):
+        raise TypeError(f"Expected a tensor for tokenizer payload, got {type(value).__name__}")
+    return value.to(torch.uint8).contiguous()
 
 
 def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False, dynamic=False, progress_callback=None):
@@ -213,7 +232,12 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                         shape = shape[:-1]
 
         # add to state dict
-        if dynamic and sd_key not in custom_quant_tensor_names:
+        raw_byte_tensor = sd_key in RAW_BYTE_TENSOR_KEYS and len(shape) == 1
+        if raw_byte_tensor and tensor.tensor_type == gguf.GGMLQuantizationType.I8:
+            # GGUF has no U8 type. I8 is used only as a byte-preserving
+            # container for tokenizer payloads.
+            state_dict[sd_key] = torch_tensor.view(torch.uint8).reshape(shape)
+        elif dynamic and sd_key not in custom_quant_tensor_names:
             if tensor.tensor_type in {
                 gguf.GGMLQuantizationType.F32,
                 gguf.GGMLQuantizationType.F16,
@@ -974,6 +998,8 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None):
         progress_callback=progress_callback,
     )
     arch = extra.get("arch_str", None)
+    if arch == "minimax_music3" and "tokenizer_json" in sd:
+        sd["tokenizer_json"] = normalize_raw_byte_tensor(sd["tokenizer_json"])
     if arch in {"t5", "t5encoder"}:
         temb_key = "token_embd.weight"
         if temb_key in sd and sd[temb_key].shape == (256384, 4096):

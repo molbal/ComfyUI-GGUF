@@ -408,6 +408,73 @@ class MiniMaxMusic3ConversionTests(unittest.TestCase):
             gguf.GGMLQuantizationType.I8,
         )
 
+    def test_tokenizer_json_roundtrips_as_raw_bytes_for_all_quantizers(self):
+        tokenizer_json = b'{"text":"caf\xc3\xb6"}'
+        state_dict = {
+            "model.embed_tokens_prefill.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.embed_tokens_audio.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.audio_extra_embedding.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.audio_decoder.pos_embedding.weight": torch.ones((16, 32), dtype=torch.bfloat16),
+            "model.lm_head_pruned.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.audio_decoder.audio_heads.0.weight": torch.ones((64, 32), dtype=torch.bfloat16),
+            "model.layers.0.self_attn.qkv_proj.weight": torch.ones((96, 32), dtype=torch.bfloat16),
+            "tokenizer_json": torch.tensor(list(tokenizer_json), dtype=torch.uint8),
+        }
+        model_arch = detect_arch(state_dict)
+        plan, _, _ = plan_target_size_quantization(
+            state_dict,
+            model_arch,
+            max_size_mb=1,
+        )
+        self.assertEqual(plan["tokenizer_json"], gguf.GGMLQuantizationType.I8)
+
+        loader = load_gguf_loader()
+        for quant_type in ("Q4_0", "Q8_CR"):
+            with self.subTest(quant_type=quant_type), TemporaryDirectory() as temp_dir:
+                output_path = Path(temp_dir) / f"minimax_music3_text_encoder-{quant_type}.gguf"
+                converted_path, _ = convert_state_dict(
+                    state_dict,
+                    str(output_path),
+                    quant_type_name=quant_type,
+                    quantization_device="cpu",
+                )
+                reader = gguf.GGUFReader(converted_path)
+                tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+                self.assertEqual(
+                    tensor_types["tokenizer_json"],
+                    gguf.GGMLQuantizationType.I8,
+                )
+                loaded = loader.gguf_clip_loader(converted_path)
+                self.assertEqual(loaded["tokenizer_json"].dtype, torch.uint8)
+                self.assertEqual(loaded["tokenizer_json"].tolist(), list(tokenizer_json))
+                reader.tensors.clear()
+                reader.fields.clear()
+                reader.data._mmap.close()
+                del reader
+                del loaded
+                gc.collect()
+
+    def test_clip_loader_restores_legacy_float_tokenizer_bytes(self):
+        loader = load_gguf_loader()
+        tokenizer_json = b'{"text":"caf\xc3\xb6"}'
+        legacy = torch.tensor(list(tokenizer_json), dtype=torch.float32)
+        with mock.patch.object(
+            loader,
+            "gguf_sd_loader",
+            return_value=(
+                {"tokenizer_json": loader.GGMLTensor(
+                    legacy,
+                    tensor_type=gguf.GGMLQuantizationType.F32,
+                    tensor_shape=legacy.shape,
+                )},
+                {"arch_str": "minimax_music3"},
+            ),
+        ):
+            loaded = loader.gguf_clip_loader("legacy-minimax-music3.gguf")
+
+        self.assertEqual(loaded["tokenizer_json"].dtype, torch.uint8)
+        self.assertEqual(loaded["tokenizer_json"].tolist(), list(tokenizer_json))
+
 
 class LTX25ConversionTests(unittest.TestCase):
     def test_detects_ltx25_audio_video_transformer(self):

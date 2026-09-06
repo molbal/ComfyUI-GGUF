@@ -180,6 +180,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 out_weight = weight.to(device_to)
                 patches = move_patch_to_device(patches, self.load_device if self.patch_on_device else self.offload_device)
                 install_patch(patches, key)
+                logging.warning(f"Q4_CR type GGUF is best used with the f{UnetLoaderGGUFDynamicVRAM.TITLE} loader node, because using it with Legacy VRAM is much slower.")
                 if inplace_update:
                     comfy.utils.copy_to_param(self.model, key, out_weight)
                 else:
