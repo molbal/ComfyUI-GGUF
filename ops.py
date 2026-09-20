@@ -1,5 +1,6 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 import copy
+import inspect
 import gguf
 import json
 import torch
@@ -11,7 +12,24 @@ from numbers import Real
 import comfy.ops
 import comfy.lora
 import comfy.model_management
+import comfy.quant_ops
 from .dequant import dequantize_tensor, is_quantized
+
+
+# ComfyUI and comfy_kitchen can be upgraded independently. Newer ComfyUI
+# passes activation-quantization kwargs that older kitchen releases reject.
+# Filter only unsupported optional kwargs so GGUF remains usable across the
+# supported version combinations.
+_int8_linear = comfy.quant_ops.ck.int8_linear
+_int8_linear_params = inspect.signature(_int8_linear).parameters
+if "input_act_weight" not in _int8_linear_params:
+    def _compat_int8_linear(*args, **kwargs):
+        return _int8_linear(
+            *args,
+            **{name: value for name, value in kwargs.items() if name in _int8_linear_params},
+        )
+
+    comfy.quant_ops.ck.int8_linear = _compat_int8_linear
 
 
 _PERF_LOG_ENV = "COMFYUI_GGUF_PERF_LOG"
