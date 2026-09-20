@@ -42,6 +42,7 @@ class ModelTemplate:
     keys_banned = []  # list of keys that should mark model as invalid for conversion
     keys_hiprec = []  # list of keys that need to be kept in fp32 for some reason
     keys_noquant = [] # list of keys that must retain their source precision
+    keys_q8_cr = [] # keys that use native INT8 ConvRot in a Q4_CR conversion
     keys_ignore = []  # list of strings to ignore keys by when found
 
     def handle_nd_tensor(self, key, data):
@@ -372,10 +373,96 @@ class ModelMiniMaxMusic3TextEncoder(ModelTemplate):
     ]
 
 
+class ModelQwen3(ModelTemplate):
+    arch = "qwen3"
+    keys_detect = [
+        (
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k_norm.weight",
+            "blk.0.ffn_gate.weight",
+        )
+    ]
+    keys_noquant = [
+        "token_embd",
+        "output_norm",
+        "attn_norm",
+        "ffn_norm",
+        "attn_q_norm",
+        "attn_k_norm",
+    ]
+
+
+class ModelQwenImage21(ModelTemplate):
+    arch = "qwen_image21"
+    keys_detect = [
+        (
+            "txt_in.text_norm.weight",
+            "modulation.1.weight",
+            "transformer_blocks.0.attn.norm_q.weight",
+            "img_in.weight",
+            "proj_out.weight",
+        )
+    ]
+    # Conditioning, modulation, normalization, and input/output projections are
+    # numerically sensitive and are kept at source precision for image quality.
+    keys_noquant = [
+        "^txt_in.",
+        "^modulation.",
+        "^time_text_embed.",
+        "^norm_out.",
+        "^img_in.",
+        "^proj_out.",
+        ".attn.norm_q.",
+        ".attn.norm_k.",
+    ]
+    # A Q4_CR build uses native INT8 ConvRot for attention instead of BF16.
+    keys_q8_cr = [
+        "transformer_blocks.*.attn.to_q.*",
+        "transformer_blocks.*.attn.to_k.*",
+        "transformer_blocks.*.attn.to_v.*",
+        "transformer_blocks.*.attn.to_out.*",
+    ]
+
+
 arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
              ModelLTXV, ModelLTXVUpsampler, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
              ModelKrea2, ModelIdeogram, ModelMinimaxH3, ModelMinimaxH3VAE,
-             ModelMiniMaxMusic3DiT, ModelMiniMaxMusic3TextEncoder]
+             ModelMiniMaxMusic3DiT, ModelMiniMaxMusic3TextEncoder, ModelQwen3,
+             ModelQwenImage21]
+
+QWEN3_HF_KEY_MAP = {
+    "embed_tokens.weight": "token_embd.weight",
+    "input_layernorm": "attn_norm",
+    "post_attention_layernorm": "ffn_norm",
+    "self_attn.q_norm": "attn_q_norm",
+    "self_attn.k_norm": "attn_k_norm",
+    "self_attn.q_proj": "attn_q",
+    "self_attn.k_proj": "attn_k",
+    "self_attn.v_proj": "attn_v",
+    "self_attn.o_proj": "attn_output",
+    "mlp.gate_proj": "ffn_gate",
+    "mlp.down_proj": "ffn_down",
+    "mlp.up_proj": "ffn_up",
+    "layers.": "blk.",
+}
+
+
+def map_qwen3_state_dict(state_dict):
+    """Map a Hugging Face Qwen3 text encoder to llama.cpp GGUF names."""
+
+    if "layers.0.self_attn.q_proj.weight" not in state_dict:
+        return state_dict
+    mapped = {}
+    for key, value in state_dict.items():
+        new_key = {
+            "embed_tokens.weight": "token_embd.weight",
+            "norm.weight": "output_norm.weight",
+        }.get(key, key)
+        for source, target in QWEN3_HF_KEY_MAP.items():
+            if source in new_key:
+                new_key = new_key.replace(source, target)
+        mapped[new_key] = value
+    return mapped
 
 def is_model_arch(model, state_dict):
     # check if model is correct
@@ -422,7 +509,7 @@ def validate_key_patterns(model_arch, state_dict):
     variant that simply doesn't include that sub-module (see ModelKrea2's
     two keys_detect alternatives, which exist for exactly this reason).
     """
-    for attr in ("keys_hiprec", "keys_noquant", "keys_ignore"):
+    for attr in ("keys_hiprec", "keys_noquant", "keys_q8_cr", "keys_ignore"):
         for pattern in getattr(model_arch, attr, []):
             if not any(key_matches(key, [pattern]) for key in state_dict.keys()):
                 logging.warning(
@@ -445,6 +532,7 @@ QUANT_TYPE_MAP = {
     # ConvRot int4 tensor-core MMA. Stored as kitchen-native packed int4 (N, K//2)
     # + per-output-row fp scales (no per-group scales/zeros).
     "Q4_CR_W4A4": (gguf.GGMLQuantizationType.I8, None),
+    "Q4_CR": (gguf.GGMLQuantizationType.I8, None),  # Alias for Q4_CR_W4A4
     # Q4_PT is retired pending a performant Ampere W4A16 backend.
     # "Q4_PT": (gguf.GGMLQuantizationType.I8, None),
 }
@@ -935,7 +1023,7 @@ def load_state_dict(path, progress_callback=None):
                 if progress_callback is not None:
                     progress_callback("read", index, len(keys))
 
-    return strip_prefix(state_dict)
+    return map_qwen3_state_dict(strip_prefix(state_dict))
 
 def load_safetensors_metadata(path):
     if not path.endswith(".safetensors"):
@@ -1078,6 +1166,8 @@ def handle_tensors(
                 # "last.modulation.lin" needs full F32, even though the
                 # broader "^last." keys_noquant entry also matches it).
                 data_qtype = gguf.GGMLQuantizationType.F32
+            elif key_matches(key, model_arch.keys_q8_cr) and quant_type_name in {"Q4_CR", "Q4_CR_W4A4"}:
+                data_qtype = gguf.GGMLQuantizationType.I8
             elif key_matches(key, model_arch.keys_noquant):
                 pass
             elif n_dims == 4 and "conv" in key.lower():
@@ -1102,13 +1192,14 @@ def handle_tensors(
         # by the ConvRot group size (default 256). Anything else falls back to F16
         # to avoid a conversion-time crash on awkward shapes.
         if (
-            quant_type_name == "Q4_CR_W4A4"
+            quant_type_name in {"Q4_CR_W4A4", "Q4_CR"}
             and (
                 n_dims != 2
                 or data.shape[1] % Q4_CR_W4A4_CONVROT_GROUP_SIZE != 0
             )
             and not key_matches(key, model_arch.keys_hiprec)
             and not key_matches(key, model_arch.keys_noquant)
+            and not key_matches(key, model_arch.keys_q8_cr)
             and not raw_byte_tensor
         ):
             data_qtype = gguf.GGMLQuantizationType.F16
@@ -1129,7 +1220,13 @@ def handle_tensors(
         if (
             data_qtype == gguf.GGMLQuantizationType.I8
             and n_dims == 2
-            and quant_type_name == "Q8_CR"
+            and (
+                quant_type_name == "Q8_CR"
+                or (
+                    quant_type_name in {"Q4_CR", "Q4_CR_W4A4"}
+                    and key_matches(key, model_arch.keys_q8_cr)
+                )
+            )
         ):
             quantization_tensor = torch.from_numpy(data)
             if q8_cr_device is None:
@@ -1177,12 +1274,13 @@ def handle_tensors(
         # int4 tensor-core MMA. Serializes kitchen-native packed int4 (N, K//2)
         # + per-output-row fp scales (no per-group scales/zeros).
         if (
-            quant_type_name == "Q4_CR_W4A4"
+            quant_type_name in {"Q4_CR_W4A4", "Q4_CR"}
             and data_qtype == gguf.GGMLQuantizationType.I8
             and n_dims == 2
             and data.shape[1] % Q4_CR_W4A4_CONVROT_GROUP_SIZE == 0
             and not key_matches(key, model_arch.keys_hiprec)
             and not key_matches(key, model_arch.keys_noquant)
+            and not key_matches(key, model_arch.keys_q8_cr)
         ):
             qdata_q4 = torch.from_numpy(data)
             if q4_cr_device is None:
@@ -1354,7 +1452,7 @@ def _streamed_safetensors_layout(path):
             source_layout[key] = torch.empty(
                 tuple(tensor_slice.get_shape()), dtype=dtype, device="meta"
             )
-    layout = strip_prefix(source_layout)
+    layout = map_qwen3_state_dict(strip_prefix(source_layout))
     source_keys = {id(value): key for key, value in source_layout.items()}
     return layout, {key: source_keys[id(value)] for key, value in layout.items()}
 

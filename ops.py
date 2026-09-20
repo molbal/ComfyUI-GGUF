@@ -554,7 +554,11 @@ def get_gguf_q8_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
 # + a per-output-row fp16 scale. The weight is pre-rotated by a block-diagonal
 # Hadamard along K; at runtime the kernel rotates the activation into the same
 # basis, so output is directly in the original space.
-def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
+def get_gguf_q4_w4a4_ops(
+    compute_dtype=torch.bfloat16,
+    full_precision_mm=False,
+    batch1_gemv=False,
+):
     try:
         from comfy_kitchen.tensor.convrot_w4a4 import (
             TensorCoreConvRotW4A4Layout,
@@ -586,6 +590,8 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 self._compute_dtype = torch.bfloat16
                 self._quantized_weight = None
                 self._quantized_weight_device = None
+                self._quantized_weight_linear_dtype = None
+                self._batch1_gemv = batch1_gemv
                 # Cache for a dequantized non-native patch. Re-quantizing a small
                 # delta to INT4 can round it away; compatible LoRA/LoKr instead use
                 # the packed base plus their low-rank output correction.
@@ -674,6 +680,7 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                 """Release every derived representation of this quantized layer."""
                 self._quantized_weight = None
                 self._quantized_weight_device = None
+                self._quantized_weight_linear_dtype = None
                 self._fused_weight = None
                 self._fused_patch_id = None
                 self._fused_weight_device = None
@@ -692,7 +699,7 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                     self._fused_bias = self._fused_bias.to(device=device)
                     self._fused_bias_device = str(device)
 
-            def _build_quantized_weight(self, device, dtype, packed=None):
+            def _build_quantized_weight(self, device, dtype, packed=None, linear_dtype="int4"):
                 if not _HAVE_KITCHEN:
                     return None
                 if packed is None:
@@ -706,27 +713,46 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                     orig_shape=self._orig_shape,
                     convrot_groupsize=self._convrot_groupsize,
                     quant_group_size=self._quant_group_size,
-                    linear_dtype="int4",
+                    linear_dtype=linear_dtype,
                 )
                 return QuantizedTensor(packed, "TensorCoreConvRotW4A4Layout", params)
 
-            def _get_cached_quantized_weight(self, device, packed=None):
+            def _get_cached_quantized_weight(self, device, packed=None, linear_dtype="int4"):
                 if packed is not None:
                     # A patched/offloaded packed weight may differ from self.weight
                     # (e.g. moved to device each forward). Build fresh; don't cache,
                     # because the packed content can change per forward.
-                    return self._build_quantized_weight(device, self._compute_dtype, packed=packed)
-                if self._quantized_weight is not None and self._quantized_weight_device == str(device):
+                    return self._build_quantized_weight(
+                        device, self._compute_dtype, packed=packed, linear_dtype=linear_dtype
+                    )
+                if (
+                    self._quantized_weight is not None
+                    and self._quantized_weight_device == str(device)
+                    and self._quantized_weight_linear_dtype == linear_dtype
+                ):
                     return self._quantized_weight
                 if self._quantized_weight is not None:
                     self._quantized_weight = None
                     if hasattr(self, "_quantized_weight_scale") and self._quantized_weight_scale is not None:
                         # Free the previous device's cached scale/params to avoid a leak.
                         self._quantized_weight_scale = None
-                qt = self._build_quantized_weight(device, self._compute_dtype)
+                qt = self._build_quantized_weight(
+                    device, self._compute_dtype, linear_dtype=linear_dtype
+                )
                 self._quantized_weight = qt
                 self._quantized_weight_device = str(device)
+                self._quantized_weight_linear_dtype = linear_dtype
                 return qt
+
+            def _linear_dtype_for_input(self, input_tensor):
+                if (
+                    self._batch1_gemv
+                    and input_tensor.device.type == "cuda"
+                    and input_tensor.numel() // input_tensor.shape[-1] <= 8
+                    and self.out_features > self.in_features
+                ):
+                    return "int8"
+                return "int4"
 
             def _fused_patch_signature(self):
                 """A cheap, stable identity for the active weight/bias patch set.
@@ -826,6 +852,7 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                     else:
                         self._quantized_weight = None
                         self._quantized_weight_device = None
+                        self._quantized_weight_linear_dtype = None
                         try:
                             fused = self._get_cached_fused_weight(device) is not None
                         except torch.OutOfMemoryError:
@@ -1068,7 +1095,10 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                                 input, bias, use_fused_weight=True
                             )
                         try:
-                            weight_qt = self._get_cached_quantized_weight(input.device)
+                            weight_qt = self._get_cached_quantized_weight(
+                                input.device,
+                                linear_dtype=self._linear_dtype_for_input(input),
+                            )
                         except torch.OutOfMemoryError:
                             if input.device.type != "cuda":
                                 raise
@@ -1134,7 +1164,10 @@ def get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
                             return self._cpu_forward_fallback(input, bias, use_fused_weight=True)
 
                 try:
-                    weight_qt = self._get_cached_quantized_weight(input.device)
+                    weight_qt = self._get_cached_quantized_weight(
+                        input.device,
+                        linear_dtype=self._linear_dtype_for_input(input),
+                    )
                     if weight_qt is None:
                         # No comfy_kitchen / non-CUDA: dequant fallback.
                         _orig_w = self._dequantized_weight(input.device, input.dtype)

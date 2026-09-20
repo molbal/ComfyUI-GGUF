@@ -41,9 +41,10 @@ Pre-quantized models (🍴 icon on ones added by this fork):
 - [MiniMax H3](https://huggingface.co/molbal/MiniMax-H3-GGUF) 🍴  
 - [MiniMax Music3](https://huggingface.co/molbal/Minimax-Music3-GGUF) 🍴  
 - [LTX 2.5](https://huggingface.co/molbal/LTX-2.5-GGUF) 🍴  
+- [Qwen Image 2.1](https://huggingface.co/molbal/Qwen-Image-2.1-GGUF) 🍴  
   
   
-> [!IMPORTANT] > Please note, that this fork does not support _K quants on diffusion models, only on text encoders. They may or may not load, but inference speed may be very slow. There may be other forks, or other custom nodes with better support for these quantization types.  
+> [!IMPORTANT] > Please note, that this fork does not support _K quants on diffusion models, only on text encoders. They may or may not load, but inference speed may be very slow. There may be other forks, or other custom nodes with better support for these quantization types.
   
 Initial support for quantizing T5 has also been added recently, these can be used using the various `*CLIPLoader (gguf)` nodes which can be used inplace of the regular ones. For the CLIP model, use whatever model you were using before for CLIP. The loader can handle both types of files - `gguf` and regular `safetensors`/`bin`.  
   
@@ -54,7 +55,7 @@ Initial support for quantizing T5 has also been added recently, these can be use
 - [Qwen3.5 GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) text encoders (0.8B, 2B, 4B, 9B, and 27B) with a ComfyUI build containing Qwen3.5 TE support. Place the matching `mmproj-*.gguf` beside the text encoder for image conditioning; text-only workflows do not need it. 🍴  
 - [Gemma 4 GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF) text encoders (E2B, E4B, 12B, and 31B) with ComfyUI v0.30.0 or later. 🍴
 
-## Converting Models (Krea 2, Ideogram 4, MiniMax H3, MiniMax Music 3)
+## Converting Models (Krea 2, Ideogram 4, MiniMax H3, MiniMax Music 3, Qwen Image 2.1)
 
 This node pack includes a GGUF converter. It has 3 possible interfaces that you can use: 
 - a python file you can call directly
@@ -75,4 +76,4 @@ Each option is documented here: [Quantizing models](https://molbal.github.io/ggu
 | Q4_1   | Standard GGML 4-bit       | Smaller files when VRAM or RAM is constrained.              |
 | Q4_0   | Standard GGML 4-bit       | Smallest supported format for constrained setups.           |
 | Q8_CR  | Per-row INT8 ConvRot      | Maintainer recommendation for NVIDIA RTX 30-series systems. |
-| Q4_CR  | Experimental INT4 ConvRot | Maintainer recommendation for NVIDIA RTX 30-series systems. |
+| Q4_CR  | Experimental INT4 ConvRot | Experimental quantization targeting INT4                    |

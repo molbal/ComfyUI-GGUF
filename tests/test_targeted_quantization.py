@@ -22,6 +22,7 @@ from tools.convert import (
     ModelMinimaxH3VAE,
     ModelMiniMaxMusic3DiT,
     ModelMiniMaxMusic3TextEncoder,
+    ModelQwenImage21,
     ModelTemplate,
     _streamed_safetensors_layout,
     convert_file,
@@ -229,6 +230,71 @@ class Q8CRConversionDeviceTests(unittest.TestCase):
 
         self.assertEqual(state_dict["weight"].dtype, torch.float8_e4m3fn)
         self.assertEqual(source_keys["weight"], "weight")
+
+
+class QwenImage21ConversionTests(unittest.TestCase):
+    def test_detects_qwen_image_21_from_distinctive_dit_keys(self):
+        state_dict = {
+            "txt_in.text_norm.weight": torch.ones(4096, dtype=torch.bfloat16),
+            "modulation.1.weight": torch.ones((16384, 4096), dtype=torch.bfloat16),
+            "transformer_blocks.0.attn.norm_q.weight": torch.ones(128, dtype=torch.bfloat16),
+            "img_in.weight": torch.ones((4096, 64), dtype=torch.bfloat16),
+            "proj_out.weight": torch.ones((64, 4096), dtype=torch.bfloat16),
+        }
+        self.assertIsInstance(detect_arch(state_dict), ModelQwenImage21)
+
+    def test_qwen_image_21_conversion_writes_architecture_and_protects_inputs(self):
+        state_dict = {
+            "txt_in.text_norm.weight": torch.ones(4096, dtype=torch.bfloat16),
+            "modulation.1.weight": torch.ones((16384, 4096), dtype=torch.bfloat16),
+            "transformer_blocks.0.attn.norm_q.weight": torch.ones(128, dtype=torch.bfloat16),
+            "transformer_blocks.0.attn.to_q.weight": torch.ones((4096, 4096), dtype=torch.bfloat16),
+            "img_in.weight": torch.ones((4096, 64), dtype=torch.bfloat16),
+            "proj_out.weight": torch.ones((64, 4096), dtype=torch.bfloat16),
+        }
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "qwen-image-2.1-Q4_0.gguf"
+            converted_path, model_arch = convert_state_dict(
+                state_dict, str(output_path), quant_type_name="Q4_0"
+            )
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            architecture = reader.get_field("general.architecture").contents()
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+
+        self.assertIsInstance(model_arch, ModelQwenImage21)
+        self.assertEqual(architecture, "qwen_image21")
+        self.assertEqual(tensor_types["transformer_blocks.0.attn.to_q.weight"], gguf.GGMLQuantizationType.Q4_0)
+        self.assertEqual(tensor_types["img_in.weight"], gguf.GGMLQuantizationType.BF16)
+
+    def test_q4_cr_keeps_attention_projections_at_source_precision(self):
+        state_dict = {
+            "txt_in.text_norm.weight": torch.ones(4096, dtype=torch.bfloat16),
+            "modulation.1.weight": torch.ones((16384, 4096), dtype=torch.bfloat16),
+            "transformer_blocks.0.attn.norm_q.weight": torch.ones(128, dtype=torch.bfloat16),
+            "transformer_blocks.0.attn.to_q.weight": torch.ones((4096, 4096), dtype=torch.bfloat16),
+            "transformer_blocks.0.img_mlp.gate_up.weight": torch.ones((24576, 4096), dtype=torch.bfloat16),
+            "img_in.weight": torch.ones((4096, 64), dtype=torch.bfloat16),
+            "proj_out.weight": torch.ones((64, 4096), dtype=torch.bfloat16),
+        }
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "qwen-image-2.1-Q4_CR.gguf"
+            converted_path, _ = convert_state_dict(
+                state_dict, str(output_path), quant_type_name="Q4_CR", quantization_device="cpu"
+            )
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+
+        self.assertEqual(tensor_types["transformer_blocks.0.attn.to_q.weight"], gguf.GGMLQuantizationType.I8)
+        self.assertEqual(tensor_types["transformer_blocks.0.attn.to_q.weight_scale"], gguf.GGMLQuantizationType.F32)
+        self.assertEqual(tensor_types["transformer_blocks.0.img_mlp.gate_up.weight"], gguf.GGMLQuantizationType.I8)
 
 
 class MiniMaxH3VAEConversionTests(unittest.TestCase):
