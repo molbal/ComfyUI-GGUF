@@ -652,6 +652,21 @@ def get_gguf_q4_w4a4_ops(
                     raise RuntimeError(f"Missing Q4_CR_W4A4 scale tensor for {prefix}")
 
                 quant_conf = json.loads(bytes(quant_raw.tolist()).decode("utf-8"))
+                if quant_conf.get("format") == "int8_tensorwise":
+                    # Mixed Q4_CR files may store selected layers as Q8_CR.
+                    # This Q4 operator cannot dispatch TensorWiseINT8 directly,
+                    # so materialize those layers safely instead of rejecting the
+                    # whole model. A native mixed backend can replace this fallback.
+                    if weight.ndim != 2 or scale.ndim != 1 or scale.shape[0] != weight.shape[0]:
+                        raise ValueError(f"Invalid mixed INT8 tensors for {prefix}")
+                    self.weight = torch.nn.Parameter(
+                        weight.to(dtype=self.factory_kwargs["dtype"]) * scale.to(
+                            device=weight.device, dtype=self.factory_kwargs["dtype"]
+                        ).unsqueeze(1),
+                        requires_grad=False,
+                    )
+                    self._quantized = False
+                    return
                 if quant_conf.get("format") != "int4_cr" or quant_conf.get("backing") != "w4a4":
                     raise ValueError(
                         f"Unsupported Q4_CR_W4A4 format for {prefix}: {quant_conf.get('format')!r} "
