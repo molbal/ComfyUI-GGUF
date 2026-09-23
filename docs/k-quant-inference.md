@@ -3,11 +3,12 @@
 ## Conclusion
 
 `_K` quants reduce GGUF storage and can reduce the resident compressed-weight
-footprint. In this repository, they do **not** execute as native low-bit matrix
-multiplication: standard GGML weights are expanded to the requested floating
-compute dtype before each affected operation. Therefore `_K` diffusion models
-can be substantially slower than `Q8_CR` and may be slower than simpler GGML
-formats despite their smaller files.
+footprint. Standard GGML weights use the portable dequantization path when no
+native backend is available. Q4_K, Q5_K, and Q6_K Linear weights can instead
+use the bundled optional Triton backend on CUDA; it receives the original GGUF
+blocks directly and fuses unpacking with the matrix multiply. Unsupported
+routes automatically fall back to the reference path, and no universal speed
+up should be assumed without a benchmark on the target GPU.
 
 `_K` remains reasonable for text encoders when the compressed file or
 CPU/offload footprint is the primary constraint and the one-time text encoding
@@ -34,9 +35,9 @@ The `_S`, `_M`, and `_L` suffixes in distribution filenames commonly describe
 how a model mixes quantization choices across tensors; they are not a separate
 single tensor encoding that this loader can execute differently.
 
-## Why This Node Can Be Slow
+## Runtime Paths
 
-The current runtime path is explicit:
+The portable fallback path is explicit:
 
 1. `GGMLLayer.cast_bias_weight()` in [`ops.py`](../ops.py) calls
    `get_weight()` for every weighted operation.
@@ -49,8 +50,45 @@ The current runtime path is explicit:
 
 Dynamic VRAM uses `GGMLLayout.dequantize()` in
 [`quant_ops.py`](../quant_ops.py), which follows the same materialization model
-for standard GGML types. The compressed data may remain mmap-backed until
-needed, but the operation still needs a full floating-point temporary.
+for unsupported types and operations. The compressed data may remain
+mmap-backed until needed, but the operation still needs a full floating-point
+temporary.
+
+For eligible 2-D Q4_K, Q5_K, and Q6_K Linear weights, both the standard
+`GGMLOps.Linear` path and Dynamic VRAM's `GGMLLayout` first offer the compressed
+GGUF bytes to the optional backend. Weight patches/LoRAs continue to use the
+portable path so ComfyUI's patch semantics remain unchanged. Unsupported
+devices, dtypes, shapes, operations, missing backends, and rejected kernel
+calls also fall back to the existing dequantized operation.
+
+### Optional backend contract
+
+Set `COMFYUI_GGUF_KQUANT_BACKEND` to an importable Python module name to
+override the bundled backend. If it is unset, the integration first probes
+`comfyui_gguf_kquant` and then the bundled Triton backend. Triton and CUDA are
+optional; when they are unavailable the reference path remains active. A
+backend module may expose itself (or `backend`) with:
+
+```python
+def supports(*, qtype, device, input_dtype, weight_shape, weight_dtype) -> bool:
+    ...
+
+def linear(*, input, weight, qtype, weight_shape, bias):
+    ...
+```
+
+`qtype` is `"Q4_K"`, `"Q5_K"`, or `"Q6_K"`. `weight` is contiguous,
+device-resident GGUF block storage; `weight_shape` is the logical `(N, K)`
+matrix. `linear` must return the same shape and device as
+`torch.nn.functional.linear(input, dequantized_weight, bias)`, using the input
+dtype. Alternatively, the module can call `register_kquant_backend()` from
+[`kquant_backend.py`](../kquant_backend.py) while it imports.
+
+The integration verifies the block-storage size and output contract. A backend
+that rejects or fails a route is disabled for that quant/device/dtype
+combination, and subsequent calls use the portable fallback. Backend packages
+remain responsible for compiled-kernel correctness, device capability checks,
+stream safety, and numerical validation against GGML dequantization.
 
 In contrast, `Q8_CR` is converted to ComfyUI's
 `TensorWiseINT8Layout`; [`get_gguf_q8_ops()`](../ops.py) retains INT8 weights
@@ -67,7 +105,7 @@ dequantize-then-FP16/BF16-matmul sequence for eligible Linear layers.
 | Diffusion denoising latency | Usually unfavorable: every sampling step revisits many layers and repeats unpacking. |
 | Text-encoder latency | May be acceptable because encoding occurs once per prompt, but measure it. |
 | Output quality at a size budget | Often better than legacy quants of comparable payload size, but architecture- and model-dependent. |
-| Native CUDA low-bit throughput | Not available through the standard `_K` path in this repository. |
+| Native low-bit throughput | Available for eligible Linear layers through the bundled Triton/CUDA backend; other routes use the portable fallback. |
 
 The actual outcome also depends on GPU, CPU, PCIe bandwidth, batch/sequence
 size, ComfyUI offload policy, and whether the model is compute- or
@@ -77,7 +115,8 @@ multiplier without a benchmark on the target workflow.
 ## Recommended Choices
 
 - **Diffusion models on NVIDIA:** Prefer `Q8_CR` for eligible transformer/DiT
-  Linear weights when it fits the quality and compatibility target.
+  Linear weights unless a compatible K-quant backend is installed and measured
+  on the target workflow.
 - **Portable diffusion GGUF:** Prefer the documented standard formats
   (`Q8_0`, `Q5_0`, `Q4_0`) and choose file size versus output quality. Do not
   select `_K` expecting faster samples.

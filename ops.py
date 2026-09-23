@@ -14,6 +14,7 @@ import comfy.lora
 import comfy.model_management
 import comfy.quant_ops
 from .dequant import dequantize_tensor, is_quantized
+from .kquant_backend import SUPPORTED_K_QUANTS, try_kquant_linear
 
 
 # ComfyUI and comfy_kitchen can be upgraded independently. Newer ComfyUI
@@ -455,6 +456,38 @@ class GGMLOps(comfy.ops.manual_cast):
             self.bias_comfy_model_dtype = dtype
 
         def forward_ggml_cast_weights(self, input):
+            weight_qtype = getattr(self.weight, "tensor_type", None)
+            weight_patches = getattr(self.weight, "patches", ())
+            bias_patches = getattr(self.bias, "patches", ()) if self.bias is not None else ()
+            if (
+                weight_qtype in SUPPORTED_K_QUANTS
+                and not weight_patches
+                and not bias_patches
+            ):
+                device = input.device
+                weight = self.weight.to(device)
+                bias = None
+                if self.bias is not None:
+                    bias = self.get_weight(self.bias.to(device), input.dtype)
+                    bias = comfy.ops.cast_to(
+                        bias,
+                        input.dtype,
+                        device,
+                        non_blocking=comfy.model_management.device_supports_non_blocking(
+                            device
+                        ),
+                        copy=False,
+                    )
+                output = try_kquant_linear(
+                    input,
+                    weight.data,
+                    weight_qtype,
+                    getattr(weight, "tensor_shape", weight.shape),
+                    bias,
+                )
+                if output is not None:
+                    return output
+
             weight, bias = self.cast_bias_weight(input)
             return torch.nn.functional.linear(input, weight, bias)
 

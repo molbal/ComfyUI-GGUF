@@ -7,3 +7,5 @@ protobuf
 # ComfyUI bundles comfy_kitchen; pin the floor that ships a working ConvRot W4A4
 # int4 MMA so Q4_CR_W4A4 loads natively on CUDA (older 0.2.26 crashes on Ampere).
 comfy-kitchen>=0.2.27
+# optional - bundled CUDA K-quant Linear backend (ComfyUI may already provide Triton)
+# triton>=3.1.0
