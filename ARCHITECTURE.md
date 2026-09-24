@@ -47,6 +47,23 @@ unsupported block alignment, active weight patches/LoRAs, and backend failures
 also use the reference path. `Q2_K`, `Q3_K`, `Q8_K`, IQ formats, and custom CR
 formats are intentionally outside this route.
 
+### K-Quant Creation
+
+`tools/convert.py` exposes uniform `Q4_K`, `Q5_K`, and `Q6_K` selections and
+the `Q4_K_S`, `Q4_K_M`, `Q5_K_S`, and `Q5_K_M` mixed presets. Mixed plans are
+computed from sorted tensor names, so streamed and in-memory conversion assign
+the same types. Architecture `keys_hiprec` and `keys_noquant` rules take
+precedence; one-dimensional, small, and convolution tensors also retain their
+safe precision. The mixed policies promote embeddings/output projections and
+sensitive attention-V, attention-output, fused-QKV, and FFN-down matrices to
+Q5_K or Q6_K according to the selected preset.
+
+K encodings use 256-value blocks. The converter validates the effective row
+shape before writing and rejects an incompatible tensor rather than silently
+changing its qtype. Payload creation uses the converter's deterministic local
+GGML-compatible encoder, so installed `gguf` builds only need container and
+reader support even when their Python K encoder is read-only.
+
 ## Target-Size Quantization Algorithm
 
 Developers can utilize `tools/convert.py --max-size-mb <MiB>` to mandate the best supported mixed quantization below a strict output size ceiling. 

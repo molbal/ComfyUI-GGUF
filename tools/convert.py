@@ -527,6 +527,18 @@ QUANT_TYPE_MAP = {
     "Q5_0": (gguf.GGMLQuantizationType.Q5_0, gguf.LlamaFileType.MOSTLY_Q5_0),
     "Q4_1": (gguf.GGMLQuantizationType.Q4_1, gguf.LlamaFileType.MOSTLY_Q4_1),
     "Q4_0": (gguf.GGMLQuantizationType.Q4_0, gguf.LlamaFileType.MOSTLY_Q4_0),
+    # Raw K types are uniform selections. Their closest standard GGUF file
+    # types are the corresponding small presets; unlike the named presets
+    # below, no tensor-category promotions are applied.
+    "Q4_K": (gguf.GGMLQuantizationType.Q4_K, gguf.LlamaFileType.MOSTLY_Q4_K_S),
+    "Q5_K": (gguf.GGMLQuantizationType.Q5_K, gguf.LlamaFileType.MOSTLY_Q5_K_S),
+    "Q6_K": (gguf.GGMLQuantizationType.Q6_K, gguf.LlamaFileType.MOSTLY_Q6_K),
+    # Mixed presets use the listed type as a baseline. plan_k_quantization()
+    # promotes sensitive tensor categories deterministically.
+    "Q4_K_S": (gguf.GGMLQuantizationType.Q4_K, gguf.LlamaFileType.MOSTLY_Q4_K_S),
+    "Q4_K_M": (gguf.GGMLQuantizationType.Q4_K, gguf.LlamaFileType.MOSTLY_Q4_K_M),
+    "Q5_K_S": (gguf.GGMLQuantizationType.Q5_K, gguf.LlamaFileType.MOSTLY_Q5_K_S),
+    "Q5_K_M": (gguf.GGMLQuantizationType.Q5_K, gguf.LlamaFileType.MOSTLY_Q5_K_M),
     "Q8_CR": (gguf.GGMLQuantizationType.I8, None),  # INT8 ConvRot (ComfyUI native)
     # Q4_CR_W4A4 is a custom W4A4 INT4 format backed by comfy_kitchen's fast
     # ConvRot int4 tensor-core MMA. Stored as kitchen-native packed int4 (N, K//2)
@@ -544,6 +556,57 @@ Q4_CR_W4A4_CONVROT_GROUP_SIZE = 256
 Q4_CR_W4A4_QUANT_GROUP_SIZE = 64
 QUANTIZATION_DEVICE_OPTIONS = ("auto", "cpu", "cuda")
 MEBIBYTE = 1024 * 1024
+K_QUANT_TYPES = frozenset((
+    gguf.GGMLQuantizationType.Q4_K,
+    gguf.GGMLQuantizationType.Q5_K,
+    gguf.GGMLQuantizationType.Q6_K,
+))
+K_QUANT_TYPE_NAMES = frozenset(("Q4_K", "Q5_K", "Q6_K"))
+K_QUANT_PRESETS = frozenset(("Q4_K_S", "Q4_K_M", "Q5_K_S", "Q5_K_M", "Q6_K"))
+K_QUANT_SELECTIONS = K_QUANT_TYPE_NAMES | K_QUANT_PRESETS
+K_QUANT_BLOCK_SIZE = 256
+
+_K_ATTENTION_V_PATTERNS = (
+    "attn_v.weight",
+    ".to_v.weight",
+    ".v.weight",
+    ".attn.w1v.weight",
+    ".attn.w2v.weight",
+    ".attn.wv.weight",
+    "_attn.v_proj.weight",
+)
+_K_ATTENTION_OUTPUT_PATTERNS = (
+    "attn_output.weight",
+    ".to_out.0.weight",
+    ".to_out.weight",
+    ".attn.proj.weight",
+    ".attn.wo.weight",
+    "_attn.out_proj.weight",
+)
+_K_FUSED_QKV_PATTERNS = (
+    "attn_qkv.weight",
+    "attn.qkv.weight",
+    "attention.qkv.weight",
+    "qkv_proj.weight",
+)
+_K_FFN_DOWN_PATTERNS = (
+    "ffn_down",
+    ".ffn.2.weight",
+    ".ff.net.2.weight",
+    ".mlp.layer2.weight",
+    ".mlp.fc2.weight",
+    ".mlp.down_proj.weight",
+    ".adaln_modulation_mlp.2.weight",
+    ".feed_forward.w2.weight",
+)
+_K_EMBEDDING_OUTPUT_PATTERNS = (
+    "token_embd.weight",
+    "embed_tokens.weight",
+    "token_embedding.weight",
+    "output.weight",
+    "proj_out.weight",
+    "final_layer.linear.weight",
+)
 
 
 def _tensor_size_bytes(shape, quant_type):
@@ -577,6 +640,138 @@ def _is_raw_byte_tensor(key, data_or_dtype, ndim=None):
     if ndim is None:
         ndim = len(data_or_dtype.shape)
     return key in RAW_BYTE_TENSOR_KEYS and ndim == 1 and dtype in (torch.uint8, torch.int8)
+
+
+def _k_quant_category(key):
+    if key_matches(key, _K_ATTENTION_V_PATTERNS):
+        return "attention_v"
+    if key_matches(key, _K_ATTENTION_OUTPUT_PATTERNS):
+        return "attention_output"
+    if key_matches(key, _K_FUSED_QKV_PATTERNS):
+        return "attention_qkv"
+    if (
+        key_matches(key, _K_FFN_DOWN_PATTERNS)
+        or "experts." in key and ".w2.weight" in key
+    ):
+        return "ffn_down"
+    if key_matches(key, _K_EMBEDDING_OUTPUT_PATTERNS):
+        return "embedding_output"
+    return "other"
+
+
+def _k_matches_arch_pattern(key, patterns):
+    if key_matches(key, patterns):
+        return True
+    # Some established architecture patterns use a wildcard path segment and
+    # a trailing dot as a prefix marker. Preserve that intent in the new K
+    # planner without changing legacy quantization matching semantics.
+    return any(
+        ("*" in pattern or "?" in pattern)
+        and pattern.endswith(".")
+        and fnmatchcase(
+            key,
+            f"{pattern[1:] if pattern.startswith('^') else pattern}*",
+        )
+        for pattern in patterns
+    )
+
+
+def _k_quant_effective_last_dim(data, model_arch):
+    shape = tuple(data.shape)
+    n_params = data.numel()
+    if (
+        model_arch.shape_fix
+        and len(shape) > 1
+        and n_params >= REARRANGE_THRESHOLD
+        and n_params % K_QUANT_BLOCK_SIZE == 0
+        and shape[-1] % K_QUANT_BLOCK_SIZE != 0
+    ):
+        return K_QUANT_BLOCK_SIZE
+    return shape[-1]
+
+
+def plan_k_quantization(state_dict, model_arch, quant_type_name):
+    """Build a stable per-tensor plan for one uniform K type or mixed preset."""
+    if quant_type_name not in K_QUANT_SELECTIONS:
+        raise ValueError(
+            f"Unknown K-quant selection {quant_type_name!r}; expected one of "
+            f"{', '.join(sorted(K_QUANT_SELECTIONS))}."
+        )
+
+    base_qtype = QUANT_TYPE_MAP[quant_type_name][0]
+    mixed = quant_type_name not in K_QUANT_TYPE_NAMES
+    plan = {}
+    eligible_keys = []
+
+    # Sort by key so mixed assignments do not depend on safetensors/checkpoint
+    # insertion order and are identical in streamed and in-memory conversion.
+    for key in sorted(state_dict):
+        data = state_dict[key]
+        if _k_matches_arch_pattern(key, model_arch.keys_ignore):
+            continue
+        if key.endswith(".comfy_quant") or key.endswith("_scale") and len(data.shape) == 0:
+            continue
+        if len(data.shape) == 0 or len(data.shape) > MAX_TENSOR_DIMS:
+            continue
+
+        n_params = data.numel()
+        if _is_raw_byte_tensor(key, data):
+            plan[key] = gguf.GGMLQuantizationType.I8
+        elif len(data.shape) == 1 or n_params <= QUANTIZATION_THRESHOLD or _k_matches_arch_pattern(key, model_arch.keys_hiprec):
+            plan[key] = gguf.GGMLQuantizationType.F32
+        elif _k_matches_arch_pattern(key, model_arch.keys_noquant):
+            plan[key] = _default_qtype(data)
+        elif "conv" in key.lower():
+            # K kernels are Linear-only. This also protects flattened Conv
+            # exports whose source tensor is already two-dimensional.
+            plan[key] = _default_qtype(data)
+        else:
+            effective_last_dim = _k_quant_effective_last_dim(data, model_arch)
+            if effective_last_dim % K_QUANT_BLOCK_SIZE:
+                raise ValueError(
+                    f"{quant_type_name} cannot quantize tensor {key!r} with shape "
+                    f"{tuple(data.shape)}: the quantized row dimension must be divisible "
+                    f"by the {K_QUANT_BLOCK_SIZE}-value K-quant block size. Protect this "
+                    "tensor with keys_noquant or use a non-K quantization type."
+                )
+            plan[key] = base_qtype
+            eligible_keys.append(key)
+
+    if not mixed:
+        return plan
+
+    categories = {key: _k_quant_category(key) for key in eligible_keys}
+    for key in eligible_keys:
+        category = categories[key]
+        if quant_type_name == "Q4_K_S":
+            if category in {"attention_v", "attention_output", "ffn_down"}:
+                plan[key] = gguf.GGMLQuantizationType.Q5_K
+            elif category == "embedding_output":
+                plan[key] = gguf.GGMLQuantizationType.Q6_K
+        elif quant_type_name == "Q4_K_M":
+            if category == "attention_qkv":
+                plan[key] = gguf.GGMLQuantizationType.Q5_K
+            elif category in {
+                "attention_v",
+                "attention_output",
+                "ffn_down",
+                "embedding_output",
+            }:
+                plan[key] = gguf.GGMLQuantizationType.Q6_K
+        elif quant_type_name == "Q5_K_S":
+            if category == "embedding_output":
+                plan[key] = gguf.GGMLQuantizationType.Q6_K
+        elif quant_type_name == "Q5_K_M":
+            if category in {
+                "attention_v",
+                "attention_output",
+                "attention_qkv",
+                "ffn_down",
+                "embedding_output",
+            }:
+                plan[key] = gguf.GGMLQuantizationType.Q6_K
+
+    return plan
 
 
 def _is_target_core_tensor(key, data, model_arch):
@@ -884,6 +1079,112 @@ def retired_quantize_int4_pytorch(weight, group_size=64):
     }
     return packed, qsz, quant_conf, orig_shape
 
+def _pack_k_scales(scales, mins):
+    """Pack eight 6-bit K sub-block scales/minima into GGML's 12-byte layout."""
+    scales = np.asarray(scales, dtype=np.uint8)
+    mins = np.asarray(mins, dtype=np.uint8)
+    packed = np.empty((scales.shape[0], 12), dtype=np.uint8)
+    packed[:, :4] = (scales[:, :4] & 0x3F) | ((scales[:, 4:8] & 0x30) << 2)
+    packed[:, 4:8] = (mins[:, :4] & 0x3F) | ((mins[:, 4:8] & 0x30) << 2)
+    packed[:, 8:12] = (scales[:, 4:8] & 0x0F) | ((mins[:, 4:8] & 0x0F) << 4)
+    return packed
+
+
+def _pack_fp16_pair(first, second):
+    payload = np.empty((first.shape[0], 2), dtype=np.float16)
+    payload[:, 0] = first.astype(np.float16)
+    payload[:, 1] = second.astype(np.float16)
+    return payload.view(np.uint8)
+
+
+def _quantize_k_affine(data, qtype):
+    """Encode Q4_K/Q5_K using deterministic per-sub-block affine fitting."""
+    shape = tuple(data.shape)
+    if len(shape) == 0 or shape[-1] % K_QUANT_BLOCK_SIZE:
+        raise ValueError(f"{qtype.name} requires the last dimension divisible by 256, got {shape}")
+    block_count = int(np.prod(shape[:-1], dtype=np.int64)) * (shape[-1] // K_QUANT_BLOCK_SIZE)
+    blocks = np.asarray(data, dtype=np.float32).reshape(block_count, K_QUANT_BLOCK_SIZE)
+    groups = blocks.reshape(block_count, 8, 32)
+    levels = 15 if qtype == gguf.GGMLQuantizationType.Q4_K else 31
+    local_min = groups.min(axis=-1)
+    local_max = groups.max(axis=-1)
+    local_scale = (local_max - local_min) / levels
+    local_scale = np.where(
+        local_scale > 0,
+        local_scale,
+        np.maximum(np.abs(local_max) / levels, 1.0 / levels),
+    )
+    offset = np.maximum(-local_min, 0.0)
+    d = np.max(local_scale, axis=-1) / 63.0
+    d = np.where(d > 0, d, 1.0).astype(np.float32)
+    dmin = np.max(offset, axis=-1) / 63.0
+    dmin = np.where(dmin > 0, dmin, 1.0).astype(np.float32)
+    scales = np.clip(np.rint(local_scale / d[:, None]), 0, 63).astype(np.uint8)
+    mins = np.clip(np.rint(offset / dmin[:, None]), 0, 63).astype(np.uint8)
+    effective_scale = d[:, None, None] * scales[:, :, None]
+    effective_offset = dmin[:, None, None] * mins[:, :, None]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        q = np.rint((groups + effective_offset) / effective_scale)
+    q = np.where(effective_scale > 0, q, 0)
+    q = np.clip(q, 0, levels).astype(np.uint8).reshape(block_count, 256)
+    low = np.zeros((block_count, 128), dtype=np.uint8)
+    for group in range(8):
+        values = q[:, group * 32 : (group + 1) * 32]
+        low[:, (group // 2) * 32 : (group // 2 + 1) * 32] |= (values & 0x0F) << ((group % 2) * 4)
+    scales_payload = _pack_k_scales(scales, mins)
+    if qtype == gguf.GGMLQuantizationType.Q4_K:
+        payload = np.concatenate((_pack_fp16_pair(d, dmin), scales_payload, low), axis=1)
+    else:
+        high = np.zeros((block_count, 32), dtype=np.uint8)
+        for group in range(8):
+            values = q[:, group * 32 : (group + 1) * 32]
+            high[:, :] |= ((values >> 4) & 1) << group
+        payload = np.concatenate((_pack_fp16_pair(d, dmin), scales_payload, high, low), axis=1)
+    return payload.reshape(*shape[:-1], -1)
+
+
+def _quantize_k_q6(data):
+    """Encode Q6_K with deterministic signed 6-bit symmetric sub-block fitting."""
+    shape = tuple(data.shape)
+    if len(shape) == 0 or shape[-1] % K_QUANT_BLOCK_SIZE:
+        raise ValueError(f"Q6_K requires the last dimension divisible by 256, got {shape}")
+    block_count = int(np.prod(shape[:-1], dtype=np.int64)) * (shape[-1] // K_QUANT_BLOCK_SIZE)
+    blocks = np.asarray(data, dtype=np.float32).reshape(block_count, K_QUANT_BLOCK_SIZE)
+    groups = blocks.reshape(block_count, 16, 16)
+    max_abs = np.max(np.abs(groups), axis=-1)
+    d = np.max(max_abs, axis=-1) / (31.0 * 127.0)
+    d = np.where(d > 0, d, 1.0).astype(np.float32)
+    scales = np.clip(np.rint(max_abs / (d[:, None] * 31.0)), 1, 127).astype(np.int8)
+    effective_scale = d[:, None, None] * scales[:, :, None].astype(np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        signed = np.rint(groups / effective_scale)
+    signed = np.where(effective_scale > 0, signed, 0)
+    q = np.clip(signed, -32, 31).astype(np.int16).reshape(block_count, 256) + 32
+    ql = np.zeros((block_count, 128), dtype=np.uint8)
+    qh = np.zeros((block_count, 64), dtype=np.uint8)
+    for group in range(8):
+        values = q[:, group * 32 : (group + 1) * 32]
+        low_offset = (group // 4) * 64 + (group % 2) * 32
+        ql[:, low_offset : low_offset + 32] |= (
+            (values & 0x0F).astype(np.uint8) << (((group % 4) // 2) * 4)
+        )
+        high_offset = (group // 4) * 32
+        qh[:, high_offset : high_offset + 32] |= (
+            ((values >> 4) & 0x03).astype(np.uint8) << ((group % 4) * 2)
+        )
+    d_payload = d.astype(np.float16).reshape(-1, 1).view(np.uint8)
+    payload = np.concatenate((ql, qh, scales.view(np.uint8), d_payload), axis=1)
+    return payload.reshape(*shape[:-1], -1)
+
+
+def quantize_k(data, qtype):
+    if qtype in (gguf.GGMLQuantizationType.Q4_K, gguf.GGMLQuantizationType.Q5_K):
+        return _quantize_k_affine(data, qtype)
+    if qtype == gguf.GGMLQuantizationType.Q6_K:
+        return _quantize_k_q6(data)
+    raise ValueError(f"Unsupported local K quantizer type: {qtype.name}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Convert diffusion model safetensors/ckpt to GGUF."
@@ -918,8 +1219,12 @@ def parse_args():
         "--quant-type",
         choices=list(QUANT_TYPE_MAP.keys()),
         default=None,
-        help="Target quantization type for eligible 2-D+ tensors "
-             "(1-D biases/scales stay F32). Defaults to F16/BF16 matching the source dtype.",
+        help=(
+            "Target quantization type for eligible 2-D+ tensors. Raw Q4_K/Q5_K/Q6_K "
+            "are uniform; Q4_K_S/Q4_K_M/Q5_K_S/Q5_K_M are deterministic mixed "
+            "presets. 1-D biases/scales stay F32. Defaults to F16/BF16 matching "
+            "the source dtype."
+        ),
     )
     parser.add_argument(
         "--max-size-mb",
@@ -1332,9 +1637,31 @@ def handle_tensors(
             data = data.reshape(n_params // 256, 256)
             writer.add_array(f"comfy.gguf.orig_shape.{key}", tuple(int(dim) for dim in orig_shape))
 
+        if data_qtype in K_QUANT_TYPES and (
+            data.shape[-1] % K_QUANT_BLOCK_SIZE
+            or data.size % K_QUANT_BLOCK_SIZE
+        ):
+            raise ValueError(
+                f"{quant_type_name} cannot quantize tensor {key!r} with storage shape "
+                f"{tuple(data.shape)}: both the row dimension and total element count "
+                f"must satisfy the {K_QUANT_BLOCK_SIZE}-value K-quant block contract."
+            )
+
         try:
-            data = gguf.quants.quantize(data, data_qtype)
+            data = quantize_k(data, data_qtype) if data_qtype in K_QUANT_TYPES else gguf.quants.quantize(data, data_qtype)
+        except NotImplementedError as e:
+            if data_qtype not in K_QUANT_TYPES:
+                raise
+            raise RuntimeError(
+                f"The installed gguf package cannot encode {data_qtype.name} tensors. "
+                "Install a gguf build whose Python quantizer implements K-quant creation."
+            ) from e
         except (AttributeError, gguf.QuantError) as e:
+            if data_qtype in K_QUANT_TYPES:
+                raise ValueError(
+                    f"Failed to quantize tensor {key!r} with shape {tuple(data.shape)} "
+                    f"as {data_qtype.name}: {e}"
+                ) from e
             if verbose:
                 tqdm.write(f"falling back to F16: {e}")
             data_qtype = gguf.GGMLQuantizationType.F16
@@ -1498,9 +1825,13 @@ def convert_safetensors_streamed(
             target_size_q8_type,
             maximum_size / MEBIBYTE,
         )
+    elif quant_type_name in K_QUANT_SELECTIONS:
+        quantization_plan = plan_k_quantization(
+            state_dict, model_arch, quant_type_name
+        )
 
     quant_type = None
-    if quantization_plan is not None:
+    if quant_type_name == TARGET_SIZE_QUANT_TYPE:
         ftype_name, ftype_gguf = TARGET_SIZE_QUANT_TYPE, None
     elif quant_type_name is not None and quant_type_name in QUANT_TYPE_MAP:
         quant_type, ftype_gguf = QUANT_TYPE_MAP[quant_type_name]
@@ -1643,10 +1974,14 @@ def convert_state_dict(
             target_size_q8_type,
             maximum_size / MEBIBYTE,
         )
+    elif quant_type_name in K_QUANT_SELECTIONS:
+        quantization_plan = plan_k_quantization(
+            state_dict, model_arch, quant_type_name
+        )
 
     # resolve quant type from name if provided
     quant_type = None
-    if quantization_plan is not None:
+    if quant_type_name == TARGET_SIZE_QUANT_TYPE:
         ftype_name = TARGET_SIZE_QUANT_TYPE
         ftype_gguf = None
     elif quant_type_name is not None and quant_type_name in QUANT_TYPE_MAP:

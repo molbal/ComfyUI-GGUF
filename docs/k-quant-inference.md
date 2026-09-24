@@ -35,6 +35,26 @@ The `_S`, `_M`, and `_L` suffixes in distribution filenames commonly describe
 how a model mixes quantization choices across tensors; they are not a separate
 single tensor encoding that this loader can execute differently.
 
+## Creating K-Quant GGUFs
+
+The CLI, local conversion dashboard, and **Targeted Quantization (GGUF)** node
+offer uniform `Q4_K`, `Q5_K`, and `Q6_K`, plus mixed `Q4_K_S`, `Q4_K_M`,
+`Q5_K_S`, and `Q5_K_M` selections:
+
+```powershell
+python tools\convert.py --src model.safetensors --quant-type Q4_K_M
+```
+
+Uniform choices apply one K qtype to every eligible matrix. Mixed choices use
+a stable tensor-name plan and promote sensitive attention, FFN-down,
+embedding, and output categories while honoring each architecture's protected
+tensor rules. K rows must be divisible by 256; incompatible eligible tensors
+are rejected with their key and shape. Creation uses the converter's bundled
+deterministic GGML-compatible encoder, so an installed `gguf` package with
+read-only K support is sufficient.
+These files do not imply native low-bit execution. Eligible Linear layers may
+use the optional backend described below; every other route dequantizes first.
+
 ## Runtime Paths
 
 The portable fallback path is explicit:

@@ -5,6 +5,7 @@ import os
 from contextlib import nullcontext
 from collections import OrderedDict
 import importlib.util
+import numpy as np
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -16,6 +17,9 @@ from safetensors.torch import save_file
 
 from tools.convert import (
     MEBIBYTE,
+    K_QUANT_PRESETS,
+    K_QUANT_TYPE_NAMES,
+    QUANT_TYPE_MAP,
     ModelLTXV,
     ModelLTXVUpsampler,
     ModelMinimaxH3,
@@ -28,7 +32,9 @@ from tools.convert import (
     convert_file,
     convert_state_dict,
     detect_arch,
+    plan_k_quantization,
     plan_target_size_quantization,
+    quantize_k,
     quantize_int8_convrot,
     quantize_int4_cr_w4a4,
     resolve_quantization_device,
@@ -103,6 +109,239 @@ def nodes_factory():
         return module
     finally:
         sys.path = original_sys_path
+
+
+class KQuantizationPlanTests(unittest.TestCase):
+    def setUp(self):
+        self.model_arch = ModelTemplate()
+        self.model_arch.keys_hiprec = ["hiprec"]
+        self.model_arch.keys_noquant = ["protected"]
+        self.state_dict = OrderedDict((
+            ("blocks.0.attn.to_v.weight", torch.ones((8, 256))),
+            ("blocks.0.attn.to_out.0.weight", torch.ones((8, 256))),
+            ("blocks.0.attn.qkv.weight", torch.ones((8, 256))),
+            ("blocks.0.ff.net.2.weight", torch.ones((8, 256))),
+            ("token_embedding.weight", torch.ones((8, 256))),
+            ("blocks.0.other.weight", torch.ones((8, 256))),
+            ("protected.weight", torch.ones((8, 256), dtype=torch.bfloat16)),
+            ("hiprec.weight", torch.ones((8, 256))),
+            ("conv.weight", torch.ones((8, 256), dtype=torch.bfloat16)),
+            ("normalization.weight", torch.ones(256)),
+        ))
+
+    def test_public_k_selections_have_matching_file_types(self):
+        expected = {
+            "Q4_K": gguf.LlamaFileType.MOSTLY_Q4_K_S,
+            "Q5_K": gguf.LlamaFileType.MOSTLY_Q5_K_S,
+            "Q6_K": gguf.LlamaFileType.MOSTLY_Q6_K,
+            "Q4_K_S": gguf.LlamaFileType.MOSTLY_Q4_K_S,
+            "Q4_K_M": gguf.LlamaFileType.MOSTLY_Q4_K_M,
+            "Q5_K_S": gguf.LlamaFileType.MOSTLY_Q5_K_S,
+            "Q5_K_M": gguf.LlamaFileType.MOSTLY_Q5_K_M,
+        }
+        self.assertEqual(
+            K_QUANT_TYPE_NAMES | K_QUANT_PRESETS,
+            set(expected),
+        )
+        for name, file_type in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(QUANT_TYPE_MAP[name][1], file_type)
+
+    def test_uniform_plans_preserve_architecture_and_linear_safety_rules(self):
+        uniform_types = {
+            "Q4_K": gguf.GGMLQuantizationType.Q4_K,
+            "Q5_K": gguf.GGMLQuantizationType.Q5_K,
+            "Q6_K": gguf.GGMLQuantizationType.Q6_K,
+        }
+        for name, qtype in uniform_types.items():
+            with self.subTest(name=name):
+                plan = plan_k_quantization(self.state_dict, self.model_arch, name)
+                for key in (
+                    "blocks.0.attn.to_v.weight",
+                    "blocks.0.attn.to_out.0.weight",
+                    "blocks.0.attn.qkv.weight",
+                    "blocks.0.ff.net.2.weight",
+                    "token_embedding.weight",
+                    "blocks.0.other.weight",
+                ):
+                    self.assertEqual(plan[key], qtype)
+                self.assertEqual(plan["protected.weight"], gguf.GGMLQuantizationType.BF16)
+                self.assertEqual(plan["hiprec.weight"], gguf.GGMLQuantizationType.F32)
+                self.assertEqual(plan["conv.weight"], gguf.GGMLQuantizationType.BF16)
+                self.assertEqual(plan["normalization.weight"], gguf.GGMLQuantizationType.F32)
+
+    def test_q4_k_m_promotes_sensitive_categories(self):
+        plan = plan_k_quantization(self.state_dict, self.model_arch, "Q4_K_M")
+
+        self.assertEqual(plan["blocks.0.attn.qkv.weight"], gguf.GGMLQuantizationType.Q5_K)
+        for key in (
+            "blocks.0.attn.to_v.weight",
+            "blocks.0.attn.to_out.0.weight",
+            "blocks.0.ff.net.2.weight",
+            "token_embedding.weight",
+        ):
+            self.assertEqual(plan[key], gguf.GGMLQuantizationType.Q6_K)
+        self.assertEqual(plan["blocks.0.other.weight"], gguf.GGMLQuantizationType.Q4_K)
+
+    def test_small_and_medium_preset_assignments(self):
+        q4_small = plan_k_quantization(self.state_dict, self.model_arch, "Q4_K_S")
+        for key in (
+            "blocks.0.attn.to_v.weight",
+            "blocks.0.attn.to_out.0.weight",
+            "blocks.0.ff.net.2.weight",
+        ):
+            self.assertEqual(q4_small[key], gguf.GGMLQuantizationType.Q5_K)
+        self.assertEqual(q4_small["token_embedding.weight"], gguf.GGMLQuantizationType.Q6_K)
+        self.assertEqual(q4_small["blocks.0.attn.qkv.weight"], gguf.GGMLQuantizationType.Q4_K)
+
+        q5_small = plan_k_quantization(self.state_dict, self.model_arch, "Q5_K_S")
+        self.assertEqual(q5_small["token_embedding.weight"], gguf.GGMLQuantizationType.Q6_K)
+        self.assertEqual(q5_small["blocks.0.attn.to_v.weight"], gguf.GGMLQuantizationType.Q5_K)
+
+        q5_medium = plan_k_quantization(self.state_dict, self.model_arch, "Q5_K_M")
+        for key in (
+            "blocks.0.attn.to_v.weight",
+            "blocks.0.attn.to_out.0.weight",
+            "blocks.0.attn.qkv.weight",
+            "blocks.0.ff.net.2.weight",
+            "token_embedding.weight",
+        ):
+            self.assertEqual(q5_medium[key], gguf.GGMLQuantizationType.Q6_K)
+        self.assertEqual(q5_medium["blocks.0.other.weight"], gguf.GGMLQuantizationType.Q5_K)
+
+    def test_mixed_plan_is_independent_of_checkpoint_order(self):
+        forward = plan_k_quantization(self.state_dict, self.model_arch, "Q5_K_M")
+        reverse = plan_k_quantization(
+            OrderedDict(reversed(tuple(self.state_dict.items()))),
+            self.model_arch,
+            "Q5_K_M",
+        )
+        self.assertEqual(forward, reverse)
+
+    def test_rejects_non_aligned_k_quant_rows(self):
+        state_dict = {
+            "blocks.0.weight": torch.ones((8, 384), dtype=torch.float32),
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            "blocks.0.weight.*384.*256-value K-quant block size",
+        ):
+            plan_k_quantization(state_dict, self.model_arch, "Q5_K")
+
+    def test_shape_fix_models_can_rearrange_a_block_aligned_total(self):
+        self.model_arch.shape_fix = True
+        state_dict = {
+            "blocks.0.weight": torch.ones((512, 4), dtype=torch.float32),
+        }
+        plan = plan_k_quantization(state_dict, self.model_arch, "Q6_K")
+        self.assertEqual(plan["blocks.0.weight"], gguf.GGMLQuantizationType.Q6_K)
+
+    def test_honors_established_wildcard_prefix_protections(self):
+        model_arch = ModelTemplate()
+        model_arch.keys_hiprec = ["^blocks.*.attn.qkv_proj."]
+        plan = plan_k_quantization(
+            {
+                "blocks.0.attn.qkv_proj.weight": torch.ones((8, 256)),
+                "blocks.0.mlp.fc1.weight": torch.ones((8, 256)),
+            },
+            model_arch,
+            "Q4_K_M",
+        )
+        self.assertEqual(
+            plan["blocks.0.attn.qkv_proj.weight"],
+            gguf.GGMLQuantizationType.F32,
+        )
+        self.assertEqual(
+            plan["blocks.0.mlp.fc1.weight"],
+            gguf.GGMLQuantizationType.Q4_K,
+        )
+
+    def test_file_type_metadata_matches_every_k_selection(self):
+        state_dict = {
+            "double_blocks.0.img_attn.proj.weight": torch.ones((16, 16)),
+        }
+        for name in sorted(K_QUANT_TYPE_NAMES | K_QUANT_PRESETS):
+            with self.subTest(name=name), TemporaryDirectory() as temp_dir:
+                output_path = Path(temp_dir) / f"flux-{name}.gguf"
+                converted_path, _ = convert_state_dict(
+                    state_dict,
+                    str(output_path),
+                    quant_type_name=name,
+                )
+                reader = gguf.GGUFReader(converted_path)
+                file_type = reader.get_field("general.file_type").contents()
+                reader.tensors.clear()
+                reader.fields.clear()
+                reader.data._mmap.close()
+                del reader
+                self.assertEqual(file_type, QUANT_TYPE_MAP[name][1].value)
+
+    def test_streamed_conversion_uses_same_k_selection_and_metadata(self):
+        state_dict = {
+            "double_blocks.0.img_attn.proj.weight": torch.ones((16, 16)),
+        }
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "flux.safetensors"
+            output_path = Path(temp_dir) / "flux-Q4_K_M.gguf"
+            save_file(state_dict, str(source_path))
+            converted_path, _ = convert_file(
+                str(source_path),
+                str(output_path),
+                interact=False,
+                quant_type_name="Q4_K_M",
+                streamed=True,
+            )
+            reader = gguf.GGUFReader(converted_path)
+            file_type = reader.get_field("general.file_type").contents()
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+        self.assertEqual(file_type, gguf.LlamaFileType.MOSTLY_Q4_K_M.value)
+
+    def test_uniform_k_conversions_work_without_gguf_k_encoder(self):
+        expected = {
+            "Q4_K": gguf.GGMLQuantizationType.Q4_K,
+            "Q5_K": gguf.GGMLQuantizationType.Q5_K,
+            "Q6_K": gguf.GGMLQuantizationType.Q6_K,
+        }
+        for name, qtype in expected.items():
+            with self.subTest(name=name), TemporaryDirectory() as temp_dir:
+                state_dict = {
+                    "double_blocks.0.img_attn.proj.weight": torch.ones((8, 256)),
+                }
+                output_path = Path(temp_dir) / f"flux-{name}.gguf"
+                converted_path, _ = convert_state_dict(
+                    state_dict,
+                    str(output_path),
+                    quant_type_name=name,
+                )
+                reader = gguf.GGUFReader(converted_path)
+                tensor_type = reader.tensors[0].tensor_type
+                reader.tensors.clear()
+                reader.fields.clear()
+                reader.data._mmap.close()
+                del reader
+                self.assertEqual(tensor_type, qtype)
+
+
+    def test_local_k_encoders_round_trip_through_reference_dequantizer(self):
+        source = (np.sin(np.linspace(0.0, 40.0, 512)) * 2.0).astype(np.float32).reshape(2, 256)
+        tolerances = {
+            gguf.GGMLQuantizationType.Q4_K: 0.20,
+            gguf.GGMLQuantizationType.Q5_K: 0.10,
+            gguf.GGMLQuantizationType.Q6_K: 0.06,
+        }
+        for qtype, tolerance in tolerances.items():
+            with self.subTest(qtype=qtype.name):
+                packed = quantize_k(source, qtype)
+                decoded = dequantize(
+                    torch.from_numpy(packed), qtype, source.shape, dtype=torch.float32
+                ).numpy()
+                self.assertEqual(
+                    packed.shape[-1], gguf.GGML_QUANT_SIZES[qtype][1]
+                )
+                self.assertLess(float(np.max(np.abs(decoded - source))), tolerance)
 
 
 class TargetSizeQuantizationTests(unittest.TestCase):

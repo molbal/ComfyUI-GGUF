@@ -513,7 +513,9 @@ class TargetedQuantizationGGUF:
                         "default": TARGET_SIZE_QUANT_TYPE,
                         "tooltip": (
                             "TARGET_SIZE starts at the selected Q8 type, reduces central core matrices "
-                            "to Q5_0 then Q4_0, then ordinary 1-D tensors to BF16 only when necessary."
+                            "to Q5_0 then Q4_0, then ordinary 1-D tensors to BF16 only when necessary. "
+                            "Raw Q4_K/Q5_K/Q6_K selections are uniform; K types ending in _S or _M "
+                            "use deterministic mixed per-tensor precision."
                         ),
                     },
                 ),

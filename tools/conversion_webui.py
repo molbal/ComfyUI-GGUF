@@ -22,13 +22,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+try:
+    from .convert import QUANT_TYPE_MAP
+except ImportError:
+    from convert import QUANT_TYPE_MAP
+
 
 ROOT = Path(__file__).resolve().parent.parent
 CONVERTER = ROOT / "tools" / "convert.py"
 PAGE = Path(__file__).with_suffix(".html")
 SOURCE_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin"}
 LORA_EXTENSIONS = {".safetensors", ".gguf"}
-QUANT_TYPES = {"source", "Q8_0", "Q5_1", "Q5_0", "Q4_1", "Q4_0", "Q8_CR", "Q4_CR_W4A4"}
+QUANT_TYPES = {"source", *QUANT_TYPE_MAP}
 Q8_TYPES = {"Q8_CR", "Q8_0"}
 DEVICES = {"auto", "cpu", "cuda"}
 

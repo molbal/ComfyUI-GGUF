@@ -72,5 +72,17 @@ Each option is documented here: [Quantizing models](https://molbal.github.io/ggu
 | Q5_0   | Standard GGML 5-bit       | Lower storage alternative to `Q5_1`.                        |
 | Q4_1   | Standard GGML 4-bit       | Smaller files when VRAM or RAM is constrained.              |
 | Q4_0   | Standard GGML 4-bit       | Smallest supported format for constrained setups.           |
+| Q6_K   | Uniform GGML K 6-bit      | High-quality K-quant storage for eligible Linear weights.    |
+| Q5_K   | Uniform GGML K 5-bit      | Uniform 5-bit K-quant storage.                               |
+| Q5_K_S / Q5_K_M | Mixed GGML K     | Deterministic 5/6-bit distributions; `_M` protects more sensitive tensors. |
+| Q4_K   | Uniform GGML K 4-bit      | Uniform 4-bit K-quant storage.                               |
+| Q4_K_S / Q4_K_M | Mixed GGML K     | Deterministic 4/5/6-bit distributions; `_M` protects more sensitive tensors. |
 | Q8_CR  | Per-row INT8 ConvRot      | Maintainer recommendation for NVIDIA RTX 30-series systems. |
 | Q4_CR  | Experimental INT4 ConvRot | Experimental quantization targeting INT4                    |
+
+K-quant creation uses the GGML-compatible deterministic encoder bundled with
+this converter and requires every selected row to be divisible by 256.
+Architecture-protected, convolution, small, and one-dimensional tensors retain
+higher precision. The local encoder is used even when the installed `gguf`
+Python package only supports reading K quants; output is still validated against
+the repository’s reference dequantizer.
