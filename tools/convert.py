@@ -931,7 +931,9 @@ def quantize_q6_k(weight, device=None):
     scales = torch.where(
         suml2 > 0, sumlx / torch.where(suml2 > 0, suml2, torch.ones_like(suml2)), torch.zeros_like(suml2)
     )
-    best_diff = sumlx * scales - suml2 * scales * scales
+    # Best objective so far: scale * sumlx (= sumlx^2/suml2), matching
+    # `best = scale * sumlx` in llama.cpp make_qx_quants.
+    best = scales * sumlx
 
     # Try different iscale values for RMSE optimization
     for is_ in range(-9, 10):
@@ -949,12 +951,12 @@ def quantize_q6_k(weight, device=None):
         s_try = torch.where(
             valid, sumlx_try / torch.where(valid, suml2_try, torch.ones_like(suml2_try)), torch.zeros_like(suml2_try)
         )
-        diff_try = sumlx_try * s_try - suml2_try * s_try * s_try
-
-        # Use tolerance for floating-point comparison
-        better = valid & (diff_try > best_diff + 1e-12)
+        # Accept a candidate when its objective sumlx_try^2/suml2_try beats the
+        # best so far: sumlx_try^2 > best * suml2_try (llama.cpp:
+        # sumlx*sumlx > best*suml2). Scale and score update together.
+        better = valid & (sumlx_try * sumlx_try > best * suml2_try)
         scales = torch.where(better, s_try, scales)
-        best_diff = torch.where(better, diff_try, best_diff)
+        best = torch.where(better, s_try * sumlx_try, best)
 
     del w  # the squared-weight workspace is dead past the RMSE search
 
