@@ -523,6 +523,7 @@ QUANT_TYPE_MAP = {
     "F16":  (gguf.GGMLQuantizationType.F16,  gguf.LlamaFileType.MOSTLY_F16),
     "BF16": (gguf.GGMLQuantizationType.BF16, gguf.LlamaFileType.MOSTLY_BF16),
     "Q8_0": (gguf.GGMLQuantizationType.Q8_0, gguf.LlamaFileType.MOSTLY_Q8_0),
+    "Q6_K": (gguf.GGMLQuantizationType.Q6_K, gguf.LlamaFileType.MOSTLY_Q6_K),
     "Q5_1": (gguf.GGMLQuantizationType.Q5_1, gguf.LlamaFileType.MOSTLY_Q5_1),
     "Q5_0": (gguf.GGMLQuantizationType.Q5_0, gguf.LlamaFileType.MOSTLY_Q5_0),
     "Q4_1": (gguf.GGMLQuantizationType.Q4_1, gguf.LlamaFileType.MOSTLY_Q4_1),
@@ -721,8 +722,18 @@ def resolve_quantization_device(device):
 
 
 def _can_use_cuda_q8_cr(data, device):
+    """Return True if the GPU has enough free VRAM to ConvRot-quantize this weight."""
     # ConvRot needs the uploaded source plus F32 rotation and quantization workspaces.
     required_bytes = data.numel() * 16 + data.shape[0] * 4
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    return required_bytes <= free_bytes
+
+
+def _can_use_cuda_q6_k(data, device):
+    """Return True if the GPU has enough free VRAM to Q6_K-quantize this weight."""
+    # Q6_K holds the fp32 source, the squared-weight RMSE workspace, the current
+    # candidate and reduction temporaries at peak: ~24 bytes per element (measured).
+    required_bytes = data.numel() * Q6_K_CUDA_BYTES_PER_ELEMENT
     free_bytes, _ = torch.cuda.mem_get_info(device)
     return required_bytes <= free_bytes
 
@@ -843,6 +854,210 @@ def _build_regular_hadamard(size, dtype=torch.float32, device="cpu"):
         h = torch.kron(h, h4)
         current_size *= 4
     return h / (size ** 0.5)
+
+
+Q6_K_BLOCK_SIZE = 256  # QK_K
+Q6_K_TYPE_SIZE = 210   # bytes per block
+Q6_K_GROUP_SIZE = 16   # elements per scale group
+Q6_K_N_GROUPS = Q6_K_BLOCK_SIZE // Q6_K_GROUP_SIZE  # 16
+# Measured peak CUDA memory per weight element in quantize_q6_k: the fp32
+# source, the squared-weight RMSE workspace, the current candidate and the
+# reduction temporaries are alive at once.
+Q6_K_CUDA_BYTES_PER_ELEMENT = 24
+
+
+def quantize_q6_k(weight, device=None):
+    """
+    Quantize a 2D float32 tensor to Q6_K format (torch; CUDA with CPU fallback).
+
+    Q6_K block structure (256 elements -> 210 bytes):
+      ql:      128 x uint8 (128 bytes) - low 4 bits of quantized values
+      qh:      64 x uint8 (64 bytes)  - high 2 bits of quantized values
+      scales:  16 x int8 (16 bytes) - per-16-element group scales
+      d:       fp16 (2 bytes)   - block scale
+
+    Returns:
+        uint8 tensor with shape (n_rows, n_cols // 256 * 210)
+    """
+    if device is not None:
+        weight = weight.to(device)
+    weight = weight.to(torch.float32)
+    orig_shape = tuple(weight.shape)
+    n_rows, n_cols = orig_shape
+    if n_cols % Q6_K_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"Q6_K requires last dimension divisible by {Q6_K_BLOCK_SIZE}, got {n_cols}"
+        )
+
+    n_blocks_per_row = n_cols // Q6_K_BLOCK_SIZE
+    n_total_blocks = n_rows * n_blocks_per_row
+
+    # Reshape to (n_total_blocks, QK_K)
+    blocks = weight.reshape(n_total_blocks, Q6_K_BLOCK_SIZE)
+
+    # --- Step 1: Compute per-16-element-group scales (RMSE-optimized) ---
+    # Reshape to (n_total_blocks, N_GROUPS, 16)
+    groups = blocks.reshape(n_total_blocks, Q6_K_N_GROUPS, Q6_K_GROUP_SIZE)
+
+    # Compute max abs for each group
+    group_amax = torch.max(torch.abs(groups), dim=2)[0]  # (n_total_blocks, N_GROUPS)
+    group_max_idx = torch.argmax(torch.abs(groups), dim=2)
+    group_max = groups[
+        torch.arange(n_total_blocks, device=weight.device)[:, None],
+        torch.arange(Q6_K_N_GROUPS, device=weight.device)[None, :],
+        group_max_idx,
+    ]  # (n_total_blocks, N_GROUPS)
+
+    # Handle all-zero groups
+    zero_mask = group_amax < 1e-15
+    safe_max = torch.where(zero_mask, torch.ones_like(group_max), group_max)
+
+    # Initial iscale
+    iscale = torch.where(zero_mask, torch.zeros_like(group_max), -32.0 / safe_max)
+
+    # Initial quantization
+    l = torch.clamp(
+        torch.round(iscale[:, :, None] * groups), -32, 31
+    )  # (n_total_blocks, N_GROUPS, 16)
+
+    # RMSE optimization
+    w = groups * groups  # (n_total_blocks, N_GROUPS, 16)
+
+    # Compute initial scale
+    sumlx = torch.sum(w * groups * l, dim=2)  # (n_total_blocks, N_GROUPS)
+    suml2 = torch.sum(w * l * l, dim=2)
+    # l is dead past the initial sums. Free it (and below, each dead candidate)
+    # so the RMSE search does not hold extra full-size tensors in VRAM.
+    del l
+
+    scales = torch.where(
+        suml2 > 0, sumlx / torch.where(suml2 > 0, suml2, torch.ones_like(suml2)), torch.zeros_like(suml2)
+    )
+    # Best objective so far: scale * sumlx (= sumlx^2/suml2), matching
+    # `best = scale * sumlx` in llama.cpp make_qx_quants.
+    best = scales * sumlx
+
+    # Try different iscale values for RMSE optimization
+    for is_ in range(-9, 10):
+        if is_ == 0:
+            continue
+        iscale_try = -(32 + 0.1 * is_) / safe_max
+        l_try = torch.clamp(
+            torch.round(iscale_try[:, :, None] * groups), -32, 31
+        )
+        sumlx_try = torch.sum(w * groups * l_try, dim=2)
+        suml2_try = torch.sum(w * l_try * l_try, dim=2)
+        del l_try  # don't hold the old candidate while the next iteration recomputes it
+
+        valid = (suml2_try > 0) & ~zero_mask
+        s_try = torch.where(
+            valid, sumlx_try / torch.where(valid, suml2_try, torch.ones_like(suml2_try)), torch.zeros_like(suml2_try)
+        )
+        # Accept a candidate when its objective sumlx_try^2/suml2_try beats the
+        # best so far: sumlx_try^2 > best * suml2_try (llama.cpp:
+        # sumlx*sumlx > best*suml2). Scale and score update together.
+        better = valid & (sumlx_try * sumlx_try > best * suml2_try)
+        scales = torch.where(better, s_try, scales)
+        best = torch.where(better, s_try * sumlx_try, best)
+
+    del w  # the squared-weight workspace is dead past the RMSE search
+
+    # Handle zero groups
+    scales = torch.where(zero_mask, torch.zeros_like(scales), scales)
+
+    # --- Step 2: Find max absolute scale per block ---
+    max_abs_scale = torch.max(torch.abs(scales), dim=1)[0]  # (n_total_blocks,)
+    max_scale_idx = torch.argmax(torch.abs(scales), dim=1)
+    max_scale = scales[torch.arange(n_total_blocks, device=weight.device), max_scale_idx]
+
+    # Handle all-zero blocks
+    block_zero_mask = max_abs_scale < 1e-15
+
+    # --- Step 3: Compute block-level scale ---
+    block_iscale = torch.where(
+        block_zero_mask, torch.zeros_like(max_scale), -128.0 / torch.where(block_zero_mask, torch.ones_like(max_scale), max_scale)
+    )
+    d = torch.where(
+        block_zero_mask, torch.zeros_like(max_scale), 1.0 / torch.where(block_zero_mask, torch.ones_like(max_scale), block_iscale)
+    )
+
+    # Store d as fp16 (2 bytes)
+    d_fp16 = d.to(torch.float16)
+    d_bytes = d_fp16.view(torch.uint8).reshape(n_total_blocks, 2)
+
+    # Store per-group scales (16 bytes)
+    group_scales = torch.clamp(
+        torch.round(block_iscale[:, None] * scales), -128, 127
+    ).to(torch.int8)
+    group_scales_bytes = group_scales.view(torch.uint8)
+
+    # --- Step 4: Quantize values using block_scale * group_scale ---
+    d_j = (
+        d_fp16[:, None].to(torch.float32)
+        * group_scales.to(torch.float32)
+    )  # (n_total_blocks, N_GROUPS)
+
+    # Quantize each element
+    l_final = torch.zeros((n_total_blocks, Q6_K_BLOCK_SIZE), dtype=torch.int32, device=weight.device)
+    non_zero_d = d_j != 0
+
+    for j in range(Q6_K_N_GROUPS):
+        mask = non_zero_d[:, j]
+        if not torch.any(mask):
+            continue
+        vals = groups[mask, j, :]  # (n_nonzero, 16)
+        l_j = torch.clamp(torch.round(vals / d_j[mask, j, None]), -32, 31).to(torch.int32)
+        l_final[mask, j * Q6_K_GROUP_SIZE : (j + 1) * Q6_K_GROUP_SIZE] = l_j
+
+    # Convert to [0, 63] range (6-bit unsigned)
+    L_final = (l_final + 32).to(torch.uint8)  # (n_total_blocks, QK_K)
+
+    # --- Step 5: Pack bits ---
+    # Reshape L to (n_total_blocks, 2, 128) for the two 128-element chunks
+    L_reshaped = L_final.reshape(n_total_blocks, 2, 128)
+
+    # First chunk (indices 0-127):
+    # ql[0:32]  = (L[0:32]  & 0xF) | ((L[64:96]  & 0xF) << 4)
+    # ql[32:64] = (L[32:64] & 0xF) | ((L[96:128] & 0xF) << 4)
+    L0 = L_reshaped[:, 0, :]  # (n_total_blocks, 128)
+    ql0 = torch.zeros((n_total_blocks, 64), dtype=torch.uint8, device=weight.device)
+    ql0[:, 0:32] = (L0[:, 0:32] & 0xF) | ((L0[:, 64:96] & 0xF) << 4)
+    ql0[:, 32:64] = (L0[:, 32:64] & 0xF) | ((L0[:, 96:128] & 0xF) << 4)
+
+    # Second chunk (indices 128-255):
+    L1 = L_reshaped[:, 1, :]  # (n_total_blocks, 128)
+    ql1 = torch.zeros((n_total_blocks, 64), dtype=torch.uint8, device=weight.device)
+    ql1[:, 0:32] = (L1[:, 0:32] & 0xF) | ((L1[:, 64:96] & 0xF) << 4)
+    ql1[:, 32:64] = (L1[:, 32:64] & 0xF) | ((L1[:, 96:128] & 0xF) << 4)
+
+    ql = torch.cat([ql0, ql1], dim=1)  # (n_total_blocks, 128)
+
+    # qh: high 2 bits packed 4-per-byte
+    # qh[0:32] = (L[0:32] >> 4) | ((L[32:64] >> 4) << 2) |
+    #            ((L[64:96] >> 4) << 4) | ((L[96:128] >> 4) << 6)
+    qh0 = (
+        (L0[:, 0:32] >> 4)
+        | ((L0[:, 32:64] >> 4) << 2)
+        | ((L0[:, 64:96] >> 4) << 4)
+        | ((L0[:, 96:128] >> 4) << 6)
+    )
+    qh1 = (
+        (L1[:, 0:32] >> 4)
+        | ((L1[:, 32:64] >> 4) << 2)
+        | ((L1[:, 64:96] >> 4) << 4)
+        | ((L1[:, 96:128] >> 4) << 6)
+    )
+    qh = torch.cat([qh0, qh1], dim=1)  # (n_total_blocks, 64)
+
+    # --- Assemble output ---
+    # C struct layout: ql (128) -> qh (64) -> scales (16) -> d (2) = 210 bytes
+    output = torch.zeros((n_total_blocks, Q6_K_TYPE_SIZE), dtype=torch.uint8, device=weight.device)
+    output[:, 0:128] = ql
+    output[:, 128:192] = qh
+    output[:, 192:208] = group_scales_bytes
+    output[:, 208:210] = d_bytes
+
+    return output.reshape(n_rows, n_cols // Q6_K_BLOCK_SIZE * Q6_K_TYPE_SIZE)
 
 
 def retired_quantize_int4_pytorch(weight, group_size=64):
@@ -1046,6 +1261,12 @@ def handle_tensors(
     show_progress=True,
     verbose=True,
 ):
+    """
+    Quantize and write every tensor of a prefix-normalized state dict to the
+    GGUF writer. Drops ignored and auxiliary keys, keeps 1-D and protected
+    tensors at high precision, and quantizes eligible tensors to the requested
+    quant type (or a TARGET_SIZE plan), with per-format shape and fallback rules.
+    """
     # Pre-collect per-tensor FP8 scales (0-dim float32 tensors named "{key}_scale").
     # These must be applied to their FP8 weight tensors before GGUF quantization.
     # The actual weight value is fp8_value * scale; ignoring scale produces wrong magnitudes.
@@ -1071,6 +1292,7 @@ def handle_tensors(
     _validate_quantization_device(quantization_device)
     q8_cr_device = None
     q4_cr_device = None
+    q6_k_device = None
     tensor_items = tqdm(state_dict.items()) if show_progress else state_dict.items()
     for tensor_index, (key, data) in enumerate(tensor_items, start=1):
         old_dtype = data.dtype
@@ -1332,9 +1554,50 @@ def handle_tensors(
             data = data.reshape(n_params // 256, 256)
             writer.add_array(f"comfy.gguf.orig_shape.{key}", tuple(int(dim) for dim in orig_shape))
 
+        # Q6_K: standard GGUF 6-bit block quantization. The gguf package can
+        # dequantize Q6_K but not quantize to it, so this uses the local torch
+        # implementation (CUDA with CPU fallback) instead.
+        if (
+            quant_type_name == "Q6_K"
+            and data_qtype == gguf.GGMLQuantizationType.Q6_K
+            and n_dims == 2
+            and data.shape[1] % Q6_K_BLOCK_SIZE == 0
+            and not key_matches(key, model_arch.keys_hiprec)
+            and not key_matches(key, model_arch.keys_noquant)
+        ):
+            weight_tensor = torch.from_numpy(data)
+            if q6_k_device is None:
+                q6_k_device = resolve_quantization_device(quantization_device)
+            device = q6_k_device
+            if device.type == "cuda" and not _can_use_cuda_q6_k(weight_tensor, device):
+                logging.warning(
+                    "Q6_K CUDA fallback for %s: insufficient free VRAM for this matrix.",
+                    key,
+                )
+                device = torch.device("cpu")
+            try:
+                qdata = quantize_q6_k(weight_tensor, device=device)
+            except torch.OutOfMemoryError:
+                if device.type != "cuda":
+                    raise
+                torch.cuda.empty_cache()
+                logging.warning(
+                    "Q6_K CUDA fallback for %s: CUDA ran out of memory while quantizing.",
+                    key,
+                )
+                qdata = quantize_q6_k(weight_tensor, device=torch.device("cpu"))
+            writer.add_tensor(
+                key,
+                qdata.cpu().numpy(),
+                raw_dtype=gguf.GGMLQuantizationType.Q6_K,
+            )
+            if progress_callback is not None:
+                progress_callback("quantize", progress_offset + tensor_index, progress_total or len(state_dict))
+            continue
+
         try:
             data = gguf.quants.quantize(data, data_qtype)
-        except (AttributeError, gguf.QuantError) as e:
+        except (AttributeError, gguf.QuantError, NotImplementedError) as e:
             if verbose:
                 tqdm.write(f"falling back to F16: {e}")
             data_qtype = gguf.GGMLQuantizationType.F16
