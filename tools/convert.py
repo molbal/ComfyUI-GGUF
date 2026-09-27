@@ -722,6 +722,7 @@ def resolve_quantization_device(device):
 
 
 def _can_use_cuda_q8_cr(data, device):
+    """Return True if the GPU has enough free VRAM to ConvRot-quantize this weight."""
     # ConvRot needs the uploaded source plus F32 rotation and quantization workspaces.
     required_bytes = data.numel() * 16 + data.shape[0] * 4
     free_bytes, _ = torch.cuda.mem_get_info(device)
@@ -729,6 +730,7 @@ def _can_use_cuda_q8_cr(data, device):
 
 
 def _can_use_cuda_q6_k(data, device):
+    """Return True if the GPU has enough free VRAM to Q6_K-quantize this weight."""
     # Q6_K holds the fp32 source, the squared-weight RMSE workspace, the current
     # candidate and reduction temporaries at peak: ~24 bytes per element (measured).
     required_bytes = data.numel() * Q6_K_CUDA_BYTES_PER_ELEMENT
@@ -1259,6 +1261,12 @@ def handle_tensors(
     show_progress=True,
     verbose=True,
 ):
+    """
+    Quantize and write every tensor of a prefix-normalized state dict to the
+    GGUF writer. Drops ignored and auxiliary keys, keeps 1-D and protected
+    tensors at high precision, and quantizes eligible tensors to the requested
+    quant type (or a TARGET_SIZE plan), with per-format shape and fallback rules.
+    """
     # Pre-collect per-tensor FP8 scales (0-dim float32 tensors named "{key}_scale").
     # These must be applied to their FP8 weight tensors before GGUF quantization.
     # The actual weight value is fp8_value * scale; ignoring scale produces wrong magnitudes.
