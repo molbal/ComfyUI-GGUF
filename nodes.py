@@ -1,11 +1,14 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
+import ast
+import threading
 import torch
 import logging
 import inspect
 import collections
 import json
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from functools import partial
 
 import nodes
 import comfy.sd
@@ -27,7 +30,12 @@ from .ops import (
     log_cuda_oom_loaded_models,
     move_patch_to_device,
 )
-from .loader import gguf_sd_loader, gguf_clip_loader, gguf_tensor_count
+from .loader import (
+    device_supports_bf16,
+    gguf_sd_loader,
+    gguf_clip_loader,
+    gguf_tensor_count,
+)
 from .dequant import dequantize_tensor, is_quantized, is_torch_compatible
 from .tools.convert import (
     DEFAULT_TARGET_SIZE_Q8_TYPE,
@@ -37,7 +45,7 @@ from .tools.convert import (
     TARGET_SIZE_QUANT_TYPE,
     convert_file,
 )
-from .lora import load_gguf_lora
+from .lora import load_gguf_lora, materialize_int8_source_weights
 
 
 _DYNAMIC_VRAM_LORA_WARNING_MIN_BYTES = 64 * 1024 * 1024
@@ -322,21 +330,8 @@ class UnetLoaderGGUF:
         sd, extra = gguf_sd_loader(unet_path, progress_callback=progress.callback_for(unet_path))
         progress.complete_file(unet_path)
 
-        mode = extra.get("gguf_quant_mode")
-        if mode == "int8_convrot":
-            # Use ComfyUI native INT8 path (weights stay INT8)
-            ops = get_gguf_q8_ops(compute_dtype=torch.bfloat16)()
-        elif mode == "int4_pytorch":
-            raise RuntimeError(
-                "Q4_PT is retired because PyTorch's Ampere INT4 kernel is not "
-                "performance-competitive. Reconvert the model as Q8_CR."
-            )
-        elif mode == "int4_cr_w4a4":
-            # Q4_CR_W4A4: custom W4A4 INT4 backed by comfy_kitchen's fast
-            # ConvRot int4 tensor-core MMA.
-            ops = get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16)()
-        else:
-            ops = GGMLOps()
+        fallback_dtype = _qwen_image21_fp16_fallback_dtype(extra)
+        ops = _legacy_gguf_ops(extra, compute_dtype=fallback_dtype)
 
         if dequant_dtype in ("default", None):
             ops.Linear.dequant_dtype = None
@@ -359,13 +354,17 @@ class UnetLoaderGGUF:
         if "metadata" in valid_params:
             kwargs["metadata"] = extra.get("metadata", {})
 
+        model_options = {"custom_operations": ops}
+        if fallback_dtype is not None:
+            model_options["dtype"] = fallback_dtype
         model = comfy.sd.load_diffusion_model_state_dict(
-            sd, model_options={"custom_operations": ops}, **kwargs,
+            sd, model_options=model_options, **kwargs,
         )
         if model is None:
             logging.error("ERROR UNSUPPORTED UNET {}".format(unet_path))
             raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
         model = GGUFModelPatcher.clone(model)
+        _apply_qwen_image21_fp16_fallback(model, fallback_dtype)
         model.patch_on_device = patch_on_device
         return (model,)
 
@@ -782,17 +781,82 @@ def _clone_as_dynamic_gguf_patcher(model_patcher):
     return cloned
 
 
-def _legacy_gguf_ops(extra):
+def _qwen_image21_fp16_fallback_dtype(extra):
+    if extra.get("arch_str") != "qwen_image21" or device_supports_bf16():
+        return None
+    if getattr(comfy.model_management, "FORCE_FP32", False):
+        return None
+
+    args = getattr(comfy.model_management, "args", None)
+    if any(
+        getattr(args, flag, False)
+        for flag in (
+            "fp32_unet",
+            "fp64_unet",
+            "bf16_unet",
+            "fp8_e4m3fn_unet",
+            "fp8_e5m2_unet",
+            "fp8_e8m0fnu_unet",
+        )
+    ):
+        return None
+
+    try:
+        device = comfy.model_management.get_torch_device()
+        should_use_fp16 = getattr(comfy.model_management, "should_use_fp16", None)
+        if not callable(should_use_fp16):
+            return None
+        fp16_kwargs = {
+            "device": device,
+            "prioritize_performance": False,
+        }
+        if "manual_cast" in inspect.signature(should_use_fp16).parameters:
+            fp16_kwargs["manual_cast"] = True
+        if not should_use_fp16(**fp16_kwargs):
+            return None
+    except Exception:
+        return None
+
+    return torch.float16
+
+
+def _apply_qwen_image21_fp16_fallback(model, fallback_dtype):
+    if fallback_dtype is None:
+        return
+
+    base_model = getattr(model, "model", None)
+    if base_model is None:
+        raise RuntimeError(
+            "Could not configure Qwen-Image 2.1 GGUF FP16 fallback: "
+            "ComfyUI returned a model patcher without its base model."
+        )
+
+    base_model.manual_cast_dtype = fallback_dtype
+    model_config = getattr(base_model, "model_config", None)
+    if model_config is not None:
+        model_config.manual_cast_dtype = fallback_dtype
+
+    logging.warning(
+        "Qwen-Image 2.1 GGUF: using FP16 inference because the active device "
+        "does not support BF16. ComfyUI currently does not list FP16 as a "
+        "supported inference dtype for this architecture; numerical stability "
+        "is not guaranteed."
+    )
+
+
+def _legacy_gguf_ops(extra, compute_dtype=None):
     mode = extra.get("gguf_quant_mode")
+    if compute_dtype is None:
+        compute_dtype = torch.bfloat16
     if mode == "int8_convrot":
-        return get_gguf_q8_ops(compute_dtype=torch.bfloat16)()
+        return get_gguf_q8_ops(compute_dtype=compute_dtype)()
     if mode == "int4_pytorch":
         raise RuntimeError(
             "Q4_PT is retired because PyTorch's Ampere INT4 kernel is not "
             "performance-competitive. Reconvert the model as Q8_CR."
         )
     if mode == "int4_cr_w4a4":
-        return get_gguf_q4_w4a4_ops(compute_dtype=torch.bfloat16)()
+        return get_gguf_q4_w4a4_ops(compute_dtype=compute_dtype)()
     return GGMLOps()
 
 
@@ -816,9 +880,12 @@ def _load_dynamic_gguf_unet(unet_path, disable_dynamic=False, progress=None):
     # layers. Dynamic VRAM's default mixed-precision Linear cannot serialize a
     # bare GGML Q4_0 weight, so use the GGUF Q8 ops for both paths. Those ops
     # retain Q8_CR metadata and materialize only standard GGML layers as needed.
+    fallback_dtype = _qwen_image21_fp16_fallback_dtype(extra)
     model_options = {
-        "custom_operations": _legacy_gguf_ops(extra),
+        "custom_operations": _legacy_gguf_ops(extra, compute_dtype=fallback_dtype),
     }
+    if fallback_dtype is not None:
+        model_options["dtype"] = fallback_dtype
     model = comfy.sd.load_diffusion_model_state_dict(
         sd,
         model_options=model_options,
@@ -829,6 +896,7 @@ def _load_dynamic_gguf_unet(unet_path, disable_dynamic=False, progress=None):
         logging.error("ERROR UNSUPPORTED UNET {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
     model = GGUFModelPatcher.clone(model) if disable_dynamic else _clone_as_dynamic_gguf_patcher(model)
+    _apply_qwen_image21_fp16_fallback(model, fallback_dtype)
     model.cached_patcher_init = (_load_dynamic_gguf_unet, (unet_path,))
     return model
 
@@ -1036,6 +1104,17 @@ class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
         }
     TITLE = "Unet Loader (GGUF/Advanced)"
 
+def _resolve_clip_path(clip_name):
+    if clip_name.lower().endswith(".gguf"):
+        path = folder_paths.get_full_path("clip_gguf", clip_name)
+        if path is not None:
+            return path
+    path = folder_paths.get_full_path("clip",clip_name)
+    if path is None:
+        raise FileNotFoundError(f"CLIP model does not exist: {clip_name}")
+    return path
+
+
 class CLIPLoaderGGUF:
     @classmethod
     def INPUT_TYPES(s):
@@ -1064,7 +1143,20 @@ class CLIPLoaderGGUF:
         progress = GGUFLoadProgress(ckpt_paths)
         for p in ckpt_paths:
             if p.endswith(".gguf"):
-                sd = gguf_clip_loader(p, progress_callback=progress.callback_for(p))
+                sd, extra = gguf_clip_loader(
+                    p,
+                    progress_callback=progress.callback_for(p),
+                    return_extra=True,
+                )
+                if (
+                    extra.get("arch_str") == "qwen3vl"
+                    and extra.get("qwen3vl_text_only")
+                    and "int8_tensorwise" in extra.get("gguf_quant_formats", ())
+                ):
+                    raise RuntimeError(
+                        "Qwen3-VL 4B Q8_CR text encoders require CLIPLoaderGGUFDynamicVRAM. "
+                        "Use the single-CLIP Dynamic VRAM loader for native INT8 or its safe fallback."
+                    )
             else:
                 sd = comfy.utils.load_torch_file(p, safe_load=True)
                 if "scaled_fp8" in sd: # NOTE: Scaled FP8 would require different custom ops, but only one can be active
@@ -1087,25 +1179,166 @@ class CLIPLoaderGGUF:
         return clip
 
     def load_clip(self, clip_name, type="stable_diffusion"):
-        clip_path = folder_paths.get_full_path("clip", clip_name)
+        clip_path = _resolve_clip_path(clip_name)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
 
 
-def _load_dynamic_gguf_clip(clip_paths, clip_type, disable_dynamic=False, progress=None):
+@contextmanager
+def _suppress_expected_qwen3vl_vision_warnings():
+    thread_id = threading.get_ident()
+
+    class Filter(logging.Filter):
+        def filter(self, record):
+            if record.thread != thread_id:
+                return True
+            message = record.getMessage()
+            if message.startswith("Missing weight for layer visual."):
+                return False
+            if message.startswith("clip missing: "):
+                try:
+                    missing = ast.literal_eval(message[len("clip missing: "):])
+                except (SyntaxError, ValueError):
+                    return True
+                if missing and all(key.startswith("visual.") for key in missing):
+                    return False
+            return True
+
+    filters = []
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        current_filter = Filter()
+        handler.addFilter(current_filter)
+        filters.append((handler, current_filter))
+    try:
+        yield
+    finally:
+        for handler, current_filter in filters:
+            handler.removeFilter(current_filter)
+
+
+def _qwen3vl_q8_layout_available():
+    try:
+        import comfy.quant_ops as comfy_quant_ops
+        return (
+            getattr(comfy_quant_ops, "_CK_AVAILABLE", False)
+            and comfy_quant_ops.get_layout_class("TensorWiseINT8Layout") is not None
+        )
+    except Exception:
+        return False
+
+
+def _qwen3vl_native_q8_device():
+    device = comfy.model_management.get_torch_device()
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None, "CUDA is unavailable"
+    capability = torch.cuda.get_device_capability(device)
+    if capability < (8, 0):
+        return None, f"device compute capability {capability[0]}.{capability[1]} is below Ampere (8.0)"
+    try:
+        import comfy.quant_ops as comfy_quant_ops
+        layout = comfy_quant_ops.TensorWiseINT8Layout
+        kernel = getattr(getattr(comfy_quant_ops, "ck", None), "int8_linear", None)
+        if not getattr(comfy_quant_ops, "_CK_AVAILABLE", False) or not callable(kernel):
+            return None, "comfy_kitchen TensorWiseINT8 kernel is unavailable"
+        if not layout.supports_fast_matmul():
+            return None, "TensorWiseINT8 fast matmul is unavailable on this device"
+    except Exception as error:
+        return None, f"TensorWiseINT8 capability check failed: {error}"
+    return (device, capability), None
+
+
+def _prune_qwen3vl_vision(clip):
+    model = getattr(clip, "cond_stage_model", None)
+    transformer = next(
+        (
+            module for module in model.modules()
+            if getattr(module, "model_type", None) == "qwen3vl_4b"
+            and hasattr(module, "visual")
+        ),
+        None,
+    ) if model is not None and hasattr(model, "modules") else None
+    if transformer is None:
+        raise RuntimeError(
+            "The text-only Qwen3-VL GGUF was not loaded as a Qwen3-VL 4B model; "
+            "cannot safely disable its vision tower."
+        )
+    if getattr(transformer, "visual", None) is not None:
+        transformer.visual = None
+
+    def reject_image_embed(embed, device):
+        if isinstance(embed, dict) and embed.get("type") == "image":
+            raise ValueError(
+                "This Qwen3-VL Q8_CR GGUF is text-only and does not support image inputs."
+            )
+        return None, None
+
+    transformer.preprocess_embed = reject_image_embed
+    logging.info("Qwen3-VL 4B Q8_CR: disabled the unused vision tower; image input is rejected.")
+
+
+def _load_dynamic_gguf_clip(
+    clip_paths,
+    clip_type,
+    disable_dynamic=False,
+    progress=None,
+    enable_q8_native=False,
+):
     if not disable_dynamic:
         _require_dynamic_vram()
     progress = progress or GGUFLoadProgress(clip_paths)
     clip_data = []
+    qwen3vl_text_only = False
+    qwen3vl_native_device = None
+    qwen3vl_native_reason = "native execution was not requested"
     for path in clip_paths:
         if path.endswith(".gguf"):
-            clip_data.append(
-                gguf_clip_loader(
-                    path,
-                    dynamic=not disable_dynamic,
-                    progress_callback=progress.callback_for(path),
-                )
+            state_dict, extra = gguf_clip_loader(
+                path,
+                dynamic=not disable_dynamic,
+                progress_callback=progress.callback_for(path),
+                return_extra=True,
             )
+            clip_data.append(state_dict)
+            if extra.get("qwen3vl_text_only"):
+                if len(clip_paths) != 1:
+                    raise ValueError(
+                        "The text-only Qwen3-VL 4B Q8_CR encoder must be loaded by itself."
+                    )
+                if "int8_tensorwise" not in extra.get("gguf_quant_formats", ()):
+                    raise ValueError(
+                        "Qwen3-VL text-only metadata requires Q8_CR int8_tensorwise weights."
+                    )
+                qwen3vl_text_only = True
+                if not _qwen3vl_q8_layout_available():
+                    qwen3vl_native_reason = "ComfyUI TensorWiseINT8 layout is unavailable"
+                elif enable_q8_native and not disable_dynamic:
+                    qwen3vl_native_device, qwen3vl_native_reason = _qwen3vl_native_q8_device()
+                else:
+                    qwen3vl_native_reason = (
+                        "native execution is limited to the single Dynamic VRAM CLIP loader"
+                    )
+                if qwen3vl_native_device is None:
+                    restored = materialize_int8_source_weights(state_dict)
+                    if restored == 0:
+                        raise ValueError(
+                            "Qwen3-VL text-only GGUF contains no materializable Q8_CR Linear weights."
+                        )
+                    logging.warning(
+                        "Qwen3-VL 4B Q8_CR: native INT8 was not selected (%s); "
+                        "restored %d ConvRot weight(s) for dequantized higher-precision execution.",
+                        qwen3vl_native_reason,
+                        restored,
+                    )
+                else:
+                    device, capability = qwen3vl_native_device
+                    logging.info(
+                        "Qwen3-VL 4B Q8_CR: selecting native TensorWiseINT8 ConvRot on %s "
+                        "(compute capability %d.%d).",
+                        device,
+                        capability[0],
+                        capability[1],
+                    )
         else:
             clip_data.append(comfy.utils.load_torch_file(path, safe_load=True))
         progress.complete_file(path)
@@ -1113,30 +1346,54 @@ def _load_dynamic_gguf_clip(clip_paths, clip_type, disable_dynamic=False, progre
     model_options = {
         "initial_device": comfy.model_management.text_encoder_offload_device(),
     }
-    if disable_dynamic:
+    if qwen3vl_text_only and qwen3vl_native_device is not None:
+        q8_operations = get_gguf_q8_ops(compute_dtype=torch.bfloat16)()
+        model_options["custom_operations"] = q8_operations
+    elif disable_dynamic or qwen3vl_text_only:
         model_options["custom_operations"] = GGMLOps
 
-    clip = comfy.sd.load_text_encoder_state_dicts(
-        clip_type=clip_type,
-        state_dicts=clip_data,
-        model_options=model_options,
-        embedding_directory=folder_paths.get_folder_paths("embeddings"),
-        disable_dynamic=disable_dynamic,
+    missing_vision_context = (
+        _suppress_expected_qwen3vl_vision_warnings()
+        if qwen3vl_text_only
+        else nullcontext()
     )
+    with missing_vision_context:
+        clip = comfy.sd.load_text_encoder_state_dicts(
+            clip_type=clip_type,
+            state_dicts=clip_data,
+            model_options=model_options,
+            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            disable_dynamic=disable_dynamic,
+        )
+    if qwen3vl_text_only:
+        _prune_qwen3vl_vision(clip)
+        if qwen3vl_native_device is not None:
+            for module in clip.cond_stage_model.modules():
+                if hasattr(module, "_full_precision_mm") and hasattr(module, "_orig_shape"):
+                    module._gguf_q8_runtime_fallback = True
     clip.patcher = (
         GGUFModelPatcher.clone(clip.patcher)
         if disable_dynamic
         else _clone_as_dynamic_gguf_patcher(clip.patcher)
     )
-    clip.patcher.cached_patcher_init = (_load_dynamic_gguf_clip_patcher, (clip_paths, clip_type))
+    clip.patcher.cached_patcher_init = (
+        partial(_load_dynamic_gguf_clip_patcher, enable_q8_native=enable_q8_native),
+        (clip_paths, clip_type),
+    )
     return clip
 
 
-def _load_dynamic_gguf_clip_patcher(clip_paths, clip_type, disable_dynamic=False):
+def _load_dynamic_gguf_clip_patcher(
+    clip_paths,
+    clip_type,
+    disable_dynamic=False,
+    enable_q8_native=False,
+):
     return _load_dynamic_gguf_clip(
         clip_paths,
         clip_type,
         disable_dynamic=disable_dynamic,
+        enable_q8_native=enable_q8_native,
     ).patcher
 
 
@@ -1144,9 +1401,16 @@ class CLIPLoaderGGUFDynamicVRAM(CLIPLoaderGGUF):
     TITLE = "CLIPLoader (GGUF, Dynamic VRAM)"
 
     def load_clip(self, clip_name, type="stable_diffusion"):
-        clip_path = folder_paths.get_full_path("clip", clip_name)
+        clip_path = _resolve_clip_path(clip_name)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-        return (_load_dynamic_gguf_clip([clip_path], clip_type, progress=GGUFLoadProgress([clip_path])),)
+        return (
+            _load_dynamic_gguf_clip(
+                [clip_path],
+                clip_type,
+                progress=GGUFLoadProgress([clip_path]),
+                enable_q8_native=True,
+            ),
+        )
 
 class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
@@ -1164,8 +1428,8 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
     TITLE = "DualCLIPLoader (GGUF, Legacy node)"
 
     def load_clip(self, clip_name1, clip_name2, type):
-        clip_path1 = folder_paths.get_full_path("clip", clip_name1)
-        clip_path2 = folder_paths.get_full_path("clip", clip_name2)
+        clip_path1 = _resolve_clip_path(clip_name1)
+        clip_path2 = _resolve_clip_path(clip_name2)
         clip_paths = (clip_path1, clip_path2)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
@@ -1176,8 +1440,8 @@ class DualCLIPLoaderGGUFDynamicVRAM(DualCLIPLoaderGGUF):
 
     def load_clip(self, clip_name1, clip_name2, type):
         clip_paths = (
-            folder_paths.get_full_path("clip", clip_name1),
-            folder_paths.get_full_path("clip", clip_name2),
+            _resolve_clip_path(clip_name1),
+            _resolve_clip_path(clip_name2),
         )
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (_load_dynamic_gguf_clip(clip_paths, clip_type),)
@@ -1197,9 +1461,9 @@ class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
     TITLE = "TripleCLIPLoader (GGUF, Legacy node)"
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, type="sd3"):
-        clip_path1 = folder_paths.get_full_path("clip", clip_name1)
-        clip_path2 = folder_paths.get_full_path("clip", clip_name2)
-        clip_path3 = folder_paths.get_full_path("clip", clip_name3)
+        clip_path1 = _resolve_clip_path(clip_name1)
+        clip_path2 = _resolve_clip_path(clip_name2)
+        clip_path3 = _resolve_clip_path(clip_name3)
         clip_paths = (clip_path1, clip_path2, clip_path3)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
@@ -1210,9 +1474,9 @@ class TripleCLIPLoaderGGUFDynamicVRAM(TripleCLIPLoaderGGUF):
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, type="sd3"):
         clip_paths = (
-            folder_paths.get_full_path("clip", clip_name1),
-            folder_paths.get_full_path("clip", clip_name2),
-            folder_paths.get_full_path("clip", clip_name3),
+            _resolve_clip_path(clip_name1),
+            _resolve_clip_path(clip_name2),
+            _resolve_clip_path(clip_name3),
         )
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (_load_dynamic_gguf_clip(clip_paths, clip_type),)
@@ -1233,10 +1497,10 @@ class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
     TITLE = "QuadrupleCLIPLoader (GGUF, Legacy node)"
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, clip_name4, type="stable_diffusion"):
-        clip_path1 = folder_paths.get_full_path("clip", clip_name1)
-        clip_path2 = folder_paths.get_full_path("clip", clip_name2)
-        clip_path3 = folder_paths.get_full_path("clip", clip_name3)
-        clip_path4 = folder_paths.get_full_path("clip", clip_name4)
+        clip_path1 = _resolve_clip_path(clip_name1)
+        clip_path2 = _resolve_clip_path(clip_name2)
+        clip_path3 = _resolve_clip_path(clip_name3)
+        clip_path4 = _resolve_clip_path(clip_name4)
         clip_paths = (clip_path1, clip_path2, clip_path3, clip_path4)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
@@ -1247,10 +1511,10 @@ class QuadrupleCLIPLoaderGGUFDynamicVRAM(QuadrupleCLIPLoaderGGUF):
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, clip_name4, type="stable_diffusion"):
         clip_paths = (
-            folder_paths.get_full_path("clip", clip_name1),
-            folder_paths.get_full_path("clip", clip_name2),
-            folder_paths.get_full_path("clip", clip_name3),
-            folder_paths.get_full_path("clip", clip_name4),
+            _resolve_clip_path(clip_name1),
+            _resolve_clip_path(clip_name2),
+            _resolve_clip_path(clip_name3),
+            _resolve_clip_path(clip_name4),
         )
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (_load_dynamic_gguf_clip(clip_paths, clip_type),)

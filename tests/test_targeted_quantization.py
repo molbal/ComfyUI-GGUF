@@ -2,8 +2,9 @@ import unittest
 import json
 import gc
 import os
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from collections import OrderedDict
+from types import SimpleNamespace
 import importlib.util
 import numpy as np
 from pathlib import Path
@@ -13,8 +14,10 @@ from unittest import mock
 import gguf
 import torch
 import comfy.sd
+import comfy.quant_ops
 from safetensors.torch import save_file
 
+import tools.convert as converter
 from tools.convert import (
     MEBIBYTE,
     K_QUANT_PRESETS,
@@ -26,8 +29,17 @@ from tools.convert import (
     ModelMinimaxH3VAE,
     ModelMiniMaxMusic3DiT,
     ModelMiniMaxMusic3TextEncoder,
+    ModelQwen3,
+    ModelQwen3VL,
     ModelQwenImage21,
     ModelTemplate,
+    normalize_qwen3vl_state_dict,
+    normalize_source_state_dict,
+    QWEN3VL_SOURCE_PREFIX,
+    QWEN3VL_TEXT_ONLY_METADATA,
+    QWEN3VL_VARIANT_METADATA,
+    QWEN3VL_VISUAL_PREFIX,
+    SourceStateDict,
     _streamed_safetensors_layout,
     convert_file,
     convert_state_dict,
@@ -65,20 +77,34 @@ def load_gguf_loader():
     return module
 
 
-def ops_factory():
-    """Load the repo's ops.py and return get_gguf_q4_w4a4_ops."""
+def ops_module_factory():
+    """Load the repo's ops.py as a package module for operation-level tests."""
     import sys
     ops_path = Path(__file__).parents[1] / "ops.py"
     package_name = "comfyui_gguf_test"
+    if package_name not in sys.modules:
+        package = importlib.util.module_from_spec(
+            importlib.util.spec_from_loader(package_name, loader=None)
+        )
+        package.__path__ = [str(ops_path.parent)]
+        sys.modules[package_name] = package
+    module_name = f"{package_name}.ops"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
     spec = importlib.util.spec_from_file_location(
-        f"{package_name}.ops",
+        module_name,
         ops_path,
         submodule_search_locations=[str(ops_path.parent)],
     )
     module = importlib.util.module_from_spec(spec)
-    sys.modules[f"{package_name}.ops"] = module
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
-    return module.get_gguf_q4_w4a4_ops(torch.bfloat16)
+    return module
+
+
+def ops_factory():
+    """Load the repo's ops.py and return its W4A4 operations class."""
+    return ops_module_factory().get_gguf_q4_w4a4_ops(torch.bfloat16)
 
 
 def nodes_factory():
@@ -534,6 +560,301 @@ class QwenImage21ConversionTests(unittest.TestCase):
         self.assertEqual(tensor_types["transformer_blocks.0.attn.to_q.weight"], gguf.GGMLQuantizationType.I8)
         self.assertEqual(tensor_types["transformer_blocks.0.attn.to_q.weight_scale"], gguf.GGMLQuantizationType.F32)
         self.assertEqual(tensor_types["transformer_blocks.0.img_mlp.gate_up.weight"], gguf.GGMLQuantizationType.I8)
+
+
+class QwenImage21InferenceFallbackTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.loader = load_gguf_loader()
+        cls.nodes = nodes_factory()
+        cls.ops = ops_module_factory()
+
+    def _write_qwen21_q4_gguf(self, output_path):
+        writer = gguf.GGUFWriter(path=None, arch="qwen_image21")
+        for name in (
+            "txt_in.text_norm.weight",
+            "transformer_blocks.0.attn.norm_q.weight",
+        ):
+            writer.add_tensor(
+                name,
+                np.full((32,), 0x3F80, dtype=np.uint16),
+                raw_dtype=gguf.GGMLQuantizationType.BF16,
+            )
+        for name in ("modulation.1.weight", "img_in.weight", "proj_out.weight"):
+            writer.add_tensor(
+                name,
+                np.full((32, 32), 0x3F80, dtype=np.uint16),
+                raw_dtype=gguf.GGMLQuantizationType.BF16,
+            )
+        q4 = gguf.quants.quantize(
+            np.ones((32, 32), dtype=np.float32), gguf.GGMLQuantizationType.Q4_0
+        )
+        writer.add_tensor(
+            "transformer_blocks.0.attn.to_q.weight",
+            q4,
+            raw_dtype=gguf.GGMLQuantizationType.Q4_0,
+        )
+        writer.write_header_to_file(path=str(output_path))
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+    def _patch_node_loader(self, stack, patcher, extra):
+        progress = mock.Mock()
+        progress.callback_for.return_value = None
+        stack.enter_context(
+            mock.patch.object(self.nodes, "GGUFLoadProgress", return_value=progress)
+        )
+        stack.enter_context(
+            mock.patch.object(self.nodes, "gguf_sd_loader", return_value=({}, extra))
+        )
+        stack.enter_context(
+            mock.patch.object(self.nodes, "device_supports_bf16", return_value=False)
+        )
+        stack.enter_context(
+            mock.patch.object(
+                self.nodes.comfy.model_management,
+                "get_torch_device",
+                return_value=torch.device("cuda:0"),
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                self.nodes.comfy.model_management,
+                "should_use_fp16",
+                return_value=True,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                self.nodes.comfy.model_management,
+                "args",
+                SimpleNamespace(
+                    fp32_unet=False,
+                    fp64_unet=False,
+                    bf16_unet=False,
+                    fp8_e4m3fn_unet=False,
+                    fp8_e5m2_unet=False,
+                    fp8_e8m0fnu_unet=False,
+                ),
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                self.nodes.inspect,
+                "signature",
+                return_value=SimpleNamespace(
+                    parameters={"metadata": None, "manual_cast": None}
+                ),
+            )
+        )
+        return stack.enter_context(
+            mock.patch.object(
+                self.nodes.comfy.sd,
+                "load_diffusion_model_state_dict",
+                return_value=patcher,
+            )
+        )
+
+    def test_bf16_storage_weights_fall_back_to_fp16_in_static_and_dynamic_loading(self):
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "qwen-image-2.1-Q4_0.gguf"
+            self._write_qwen21_q4_gguf(path)
+            with mock.patch.object(
+                self.loader, "device_supports_bf16", return_value=False
+            ), mock.patch.object(
+                self.loader, "dynamic_gguf_file_slice", return_value=None
+            ):
+                static, static_extra = self.loader.gguf_sd_loader(
+                    str(path), handle_prefix=None
+                )
+                dynamic, dynamic_extra = self.loader.gguf_sd_loader(
+                    str(path), handle_prefix=None, dynamic=True
+                )
+
+                self.assertEqual(static_extra["arch_str"], "qwen_image21")
+                self.assertEqual(dynamic_extra["arch_str"], "qwen_image21")
+                self.assertEqual(static["img_in.weight"].dtype, torch.float16)
+                self.assertEqual(dynamic["img_in.weight"].dtype, torch.float16)
+                self.assertEqual(static["transformer_blocks.0.attn.norm_q.weight"].dtype, torch.float32)
+                self.assertEqual(dynamic["transformer_blocks.0.attn.norm_q.weight"].dtype, torch.float32)
+                self.assertEqual(static["transformer_blocks.0.attn.to_q.weight"].dtype, torch.float16)
+                self.assertEqual(dynamic["transformer_blocks.0.attn.to_q.weight"].dtype, torch.float16)
+                del static
+                del dynamic
+                gc.collect()
+
+                with mock.patch.object(
+                    self.loader, "device_supports_bf16", return_value=True
+                ):
+                    bf16_static, _ = self.loader.gguf_sd_loader(
+                        str(path), handle_prefix=None
+                    )
+                    bf16_dynamic, _ = self.loader.gguf_sd_loader(
+                        str(path), handle_prefix=None, dynamic=True
+                    )
+
+                self.assertEqual(bf16_static["img_in.weight"].dtype, torch.bfloat16)
+                self.assertEqual(bf16_dynamic["img_in.weight"].dtype, torch.bfloat16)
+                del bf16_static
+                del bf16_dynamic
+                gc.collect()
+
+    def test_fp16_fallback_is_limited_to_qwen21_and_fp16_capable_devices(self):
+        args = SimpleNamespace()
+        with ExitStack() as stack:
+            bf16_support = stack.enter_context(
+                mock.patch.object(self.nodes, "device_supports_bf16", return_value=False)
+            )
+            fp16_support = stack.enter_context(
+                mock.patch.object(
+                    self.nodes.comfy.model_management,
+                    "should_use_fp16",
+                    return_value=True,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    self.nodes.comfy.model_management,
+                    "get_torch_device",
+                    return_value=torch.device("cuda:0"),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(self.nodes.comfy.model_management, "args", args)
+            )
+
+            qwen21 = {"arch_str": "qwen_image21"}
+            self.assertEqual(
+                self.nodes._qwen_image21_fp16_fallback_dtype(qwen21),
+                torch.float16,
+            )
+            self.assertIsNone(
+                self.nodes._qwen_image21_fp16_fallback_dtype({"arch_str": "flux"})
+            )
+
+            bf16_support.return_value = True
+            self.assertIsNone(self.nodes._qwen_image21_fp16_fallback_dtype(qwen21))
+            bf16_support.return_value = False
+            fp16_support.return_value = False
+            self.assertIsNone(self.nodes._qwen_image21_fp16_fallback_dtype(qwen21))
+
+            fp16_support.return_value = True
+            args.fp32_unet = True
+            self.assertIsNone(self.nodes._qwen_image21_fp16_fallback_dtype(qwen21))
+            args.fp32_unet = False
+            with mock.patch.object(
+                self.nodes.comfy.model_management, "FORCE_FP32", True
+            ):
+                self.assertIsNone(
+                    self.nodes._qwen_image21_fp16_fallback_dtype(qwen21)
+                )
+
+    def test_static_loader_sets_fp16_model_and_manual_cast_dtypes(self):
+        base_model = SimpleNamespace(
+            manual_cast_dtype=None,
+            model_config=SimpleNamespace(manual_cast_dtype=None),
+        )
+        patcher = SimpleNamespace(model=base_model)
+        extra = {"arch_str": "qwen_image21", "metadata": {}}
+        custom_ops = SimpleNamespace(
+            Linear=SimpleNamespace(dequant_dtype=None, patch_dtype=None)
+        )
+
+        with ExitStack() as stack:
+            load_model = self._patch_node_loader(stack, patcher, extra)
+            stack.enter_context(
+                mock.patch.object(
+                    self.nodes, "_legacy_gguf_ops", return_value=custom_ops
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    self.nodes.folder_paths,
+                    "get_full_path",
+                    return_value="qwen-image-2.1-Q4_0.gguf",
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    self.nodes.GGUFModelPatcher, "clone", return_value=patcher
+                )
+            )
+
+            loaded, = self.nodes.UnetLoaderGGUF().load_unet("qwen-image-2.1-Q4_0.gguf")
+
+        model_options = load_model.call_args.kwargs["model_options"]
+        self.assertIs(loaded, patcher)
+        self.assertEqual(model_options["dtype"], torch.float16)
+        self.assertIs(model_options["custom_operations"], custom_ops)
+        self.assertEqual(base_model.manual_cast_dtype, torch.float16)
+        self.assertEqual(base_model.model_config.manual_cast_dtype, torch.float16)
+
+    def test_dynamic_loader_sets_fp16_model_and_manual_cast_dtypes(self):
+        base_model = SimpleNamespace(
+            manual_cast_dtype=None,
+            model_config=SimpleNamespace(manual_cast_dtype=None),
+        )
+        patcher = SimpleNamespace(model=base_model)
+        extra = {"arch_str": "qwen_image21", "metadata": {}}
+        custom_ops = SimpleNamespace(
+            Linear=SimpleNamespace(dequant_dtype=None, patch_dtype=None)
+        )
+
+        with ExitStack() as stack:
+            load_model = self._patch_node_loader(stack, patcher, extra)
+            stack.enter_context(
+                mock.patch.object(
+                    self.nodes, "_legacy_gguf_ops", return_value=custom_ops
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(self.nodes, "_require_dynamic_vram")
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    self.nodes, "_clone_as_dynamic_gguf_patcher", return_value=patcher
+                )
+            )
+
+            loaded = self.nodes._load_dynamic_gguf_unet("qwen-image-2.1-Q4_0.gguf")
+
+        model_options = load_model.call_args.kwargs["model_options"]
+        self.assertIs(loaded, patcher)
+        self.assertEqual(model_options["dtype"], torch.float16)
+        self.assertIs(model_options["custom_operations"], custom_ops)
+        self.assertEqual(base_model.manual_cast_dtype, torch.float16)
+        self.assertEqual(base_model.model_config.manual_cast_dtype, torch.float16)
+
+    def test_ggml_linear_dequantizes_q4_0_in_the_selected_fp16_compute_dtype(self):
+        packed = gguf.quants.quantize(
+            np.ones((4, 32), dtype=np.float32), gguf.GGMLQuantizationType.Q4_0
+        ).copy()
+        qweight = self.ops.GGMLTensor(
+            torch.from_numpy(packed),
+            tensor_type=gguf.GGMLQuantizationType.Q4_0,
+            tensor_shape=(4, 32),
+        )
+        layer = self.ops.GGMLOps().Linear(
+            32, 4, bias=False, device="cpu", dtype=torch.float16
+        )
+        layer.load_state_dict({"weight": qweight}, strict=False)
+
+        dequantized = layer.get_weight(layer.weight, layer.weight.dtype)
+
+        self.assertEqual(layer.weight.dtype, torch.float16)
+        self.assertEqual(dequantized.dtype, torch.float16)
+
+    def test_custom_quantized_ops_honor_selected_compute_dtype(self):
+        q8_ops = self.nodes._legacy_gguf_ops(
+            {"gguf_quant_mode": "int8_convrot"}, compute_dtype=torch.float16
+        )
+        q8_layer = q8_ops.Linear(64, 6, bias=True, device="cpu", dtype=torch.float16)
+        self.assertEqual(q8_layer.factory_kwargs["dtype"], torch.float16)
+
+        q4_ops = self.ops.get_gguf_q4_w4a4_ops(compute_dtype=torch.float16)
+        q4_layer = q4_ops.Linear(64, 64, bias=False, device="cpu", dtype=torch.float16)
+        self.assertEqual(q4_layer._compute_dtype, torch.float16)
 
 
 class MiniMaxH3VAEConversionTests(unittest.TestCase):
@@ -1259,6 +1580,270 @@ class OfflineLoraFusionTests(unittest.TestCase):
         self.assertTrue(torch.equal(merged[0, :2], torch.tensor([2.0, 0.0], dtype=torch.float16)))
 
 
+def synthetic_qwen3vl_layout():
+    language_shapes = {
+        f"{QWEN3VL_SOURCE_PREFIX}embed_tokens.weight": (32, 256),
+        f"{QWEN3VL_SOURCE_PREFIX}norm.weight": (256,),
+        f"{QWEN3VL_SOURCE_PREFIX}layers.0.input_layernorm.weight": (256,),
+        f"{QWEN3VL_SOURCE_PREFIX}layers.0.post_attention_layernorm.weight": (256,),
+        f"{QWEN3VL_SOURCE_PREFIX}layers.0.self_attn.k_norm.weight": (128,),
+        f"{QWEN3VL_SOURCE_PREFIX}layers.0.self_attn.q_norm.weight": (128,),
+        f"{QWEN3VL_SOURCE_PREFIX}layers.0.self_attn.q_proj.weight": (8, 256),
+        f"{QWEN3VL_SOURCE_PREFIX}layers.35.self_attn.q_proj.weight": (8, 256),
+    }
+    visual_shapes = {
+        f"{QWEN3VL_VISUAL_PREFIX}patch_embed.proj.weight": (4, 3, 2, 4, 4),
+        f"{QWEN3VL_VISUAL_PREFIX}pos_embed.weight": (16, 4),
+        f"{QWEN3VL_VISUAL_PREFIX}blocks.0.attn.qkv.weight": (12, 4),
+        f"{QWEN3VL_VISUAL_PREFIX}merger.linear_fc2.weight": (8, 16),
+        f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.0.norm.weight": (16,),
+        f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.2.linear_fc2.weight": (8, 16),
+    }
+    state_dict = OrderedDict(
+        (key, torch.ones(shape, dtype=torch.bfloat16))
+        for key, shape in (*language_shapes.items(), *visual_shapes.items())
+    )
+    return language_shapes, visual_shapes, state_dict
+
+
+class Qwen3VLConverterTests(unittest.TestCase):
+    def layout_patches(self, language_shapes, visual_shapes):
+        return mock.patch.multiple(
+            converter,
+            QWEN3VL_LANGUAGE_SHAPES=language_shapes,
+            QWEN3VL_VISUAL_SIGNATURE_SHAPES=visual_shapes,
+            QWEN3VL_SOURCE_LANGUAGE_TENSOR_COUNT=len(language_shapes),
+            QWEN3VL_SOURCE_VISUAL_TENSOR_COUNT=len(visual_shapes),
+            QWEN3VL_SOURCE_TENSOR_COUNT=len(language_shapes) + len(visual_shapes),
+        )
+
+    def test_recognizes_and_converts_bf16_source_to_text_only_q8_cr(self):
+        language_shapes, visual_shapes, source = synthetic_qwen3vl_layout()
+        with self.layout_patches(language_shapes, visual_shapes):
+            self.assertIsInstance(detect_arch(source), ModelQwen3VL)
+            normalized = normalize_qwen3vl_state_dict(source)
+            self.assertIsInstance(normalized, SourceStateDict)
+            self.assertEqual(normalized.architecture_hint, "qwen3vl")
+            model_arch = detect_arch(normalized)
+            self.assertIsInstance(model_arch, ModelQwen3VL)
+            self.assertEqual(model_arch.arch, "qwen3vl")
+
+            with TemporaryDirectory() as temp_dir:
+                output_path = Path(temp_dir) / "qwen3vl-4b-Q8_CR.gguf"
+                convert_state_dict(
+                    source,
+                    str(output_path),
+                    quant_type_name="Q8_CR",
+                    quantization_device="cpu",
+                )
+                reader = gguf.GGUFReader(str(output_path))
+                tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+                metadata = load_gguf_loader().get_gguf_metadata(reader)
+                text_only = metadata[QWEN3VL_TEXT_ONLY_METADATA]
+                variant = metadata[QWEN3VL_VARIANT_METADATA]
+                reader.tensors.clear()
+                reader.fields.clear()
+                reader.data._mmap.close()
+                del reader
+
+        self.assertEqual(tensor_types["token_embd.weight"], gguf.GGMLQuantizationType.BF16)
+        self.assertEqual(tensor_types["output_norm.weight"], gguf.GGMLQuantizationType.F32)
+        self.assertEqual(tensor_types["blk.0.attn_q.weight"], gguf.GGMLQuantizationType.I8)
+        self.assertEqual(tensor_types["blk.35.attn_q.weight"], gguf.GGMLQuantizationType.I8)
+        self.assertFalse(any(name.startswith("model.visual.") for name in tensor_types))
+        self.assertTrue(text_only)
+        self.assertEqual(variant, "4b")
+
+    def test_streamed_safetensors_conversion_emits_qwen3vl_metadata(self):
+        language_shapes, visual_shapes, source = synthetic_qwen3vl_layout()
+        with self.layout_patches(language_shapes, visual_shapes), TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "qwen3vl-4b.safetensors"
+            output_path = Path(temp_dir) / "qwen3vl-4b-Q8_CR.gguf"
+            save_file(source, str(source_path))
+
+            converted_path, _ = convert_file(
+                str(source_path),
+                str(output_path),
+                interact=False,
+                quant_type_name="Q8_CR",
+                quantization_device="cpu",
+                streamed=True,
+            )
+            reader = gguf.GGUFReader(converted_path)
+            metadata = load_gguf_loader().get_gguf_metadata(reader)
+            tensor_names = {tensor.name for tensor in reader.tensors}
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+
+        self.assertTrue(metadata[QWEN3VL_TEXT_ONLY_METADATA])
+        self.assertEqual(metadata[QWEN3VL_VARIANT_METADATA], "4b")
+        self.assertIn("blk.35.attn_q.weight", tensor_names)
+        self.assertFalse(any(name.startswith("model.visual.") for name in tensor_names))
+
+    def test_qwen3_source_is_not_misdetected_as_qwen3vl(self):
+        source = OrderedDict(
+            (
+                ("layers.0.self_attn.q_proj.weight", torch.ones((8, 256))),
+                ("layers.0.self_attn.k_norm.weight", torch.ones((128,))),
+                ("layers.0.mlp.gate_proj.weight", torch.ones((8, 256))),
+            )
+        )
+
+        normalized = normalize_source_state_dict(source)
+
+        self.assertIsInstance(detect_arch(normalized), ModelQwen3)
+
+    def test_rejects_non_bf16_and_incompatible_or_text_only_sources(self):
+        language_shapes, visual_shapes, source = synthetic_qwen3vl_layout()
+        with self.layout_patches(language_shapes, visual_shapes):
+            mixed_dtype = source.copy()
+            key = f"{QWEN3VL_SOURCE_PREFIX}layers.35.self_attn.q_proj.weight"
+            mixed_dtype[key] = mixed_dtype[key].to(torch.float16)
+            with self.assertRaisesRegex(ValueError, "BF16 tensors only"):
+                normalize_qwen3vl_state_dict(mixed_dtype)
+
+            text_only = OrderedDict(
+                (key, value) for key, value in source.items()
+                if not key.startswith(QWEN3VL_VISUAL_PREFIX)
+            )
+            with self.assertRaisesRegex(ValueError, "both language and visual tensors"):
+                normalize_qwen3vl_state_dict(text_only)
+
+            incompatible = OrderedDict(source)
+            incompatible["model.language_model.unexpected.weight"] = torch.ones(
+                (1,), dtype=torch.bfloat16
+            )
+            with self.assertRaisesRegex(ValueError, "official Qwen3-VL 4B BF16 checkpoint"):
+                normalize_qwen3vl_state_dict(incompatible)
+
+    def test_rejects_other_quantizers_for_qwen3vl(self):
+        language_shapes, visual_shapes, source = synthetic_qwen3vl_layout()
+        with self.layout_patches(language_shapes, visual_shapes):
+            with self.assertRaisesRegex(ValueError, "only as a text-only Q8_CR GGUF"):
+                convert_state_dict(
+                    source,
+                    "unused.gguf",
+                    quant_type_name="Q4_0",
+                    quantization_device="cpu",
+                )
+
+
+class Qwen3VLNativeOpsTests(unittest.TestCase):
+    def test_native_kernel_error_retries_portable_dequantized_linear(self):
+        ops_module = ops_module_factory()
+        source = torch.randn((6, 64), dtype=torch.bfloat16)
+        qdata, scale, quant_conf, shape = quantize_int8_convrot(
+            source,
+            convrot_groupsize=16,
+            device=torch.device("cpu"),
+        )
+        params = comfy.quant_ops.TensorWiseINT8Layout.Params(
+            scale=scale,
+            orig_dtype=torch.bfloat16,
+            orig_shape=shape,
+            convrot=quant_conf["convrot"],
+            convrot_groupsize=quant_conf["convrot_groupsize"],
+        )
+        qweight = comfy.quant_ops.QuantizedTensor(
+            qdata,
+            "TensorWiseINT8Layout",
+            params,
+        )
+        operations = ops_module.get_gguf_q8_ops(compute_dtype=torch.bfloat16)
+        layer = operations.Linear(64, 6, bias=True, device="cpu", dtype=torch.bfloat16)
+        layer.weight = torch.nn.Parameter(qweight, requires_grad=False)
+        layer.bias = torch.nn.Parameter(torch.randn(6, dtype=torch.bfloat16), requires_grad=False)
+        layer._gguf_q8_runtime_fallback = True
+        inputs = torch.randn((2, 3, 64), dtype=torch.bfloat16)
+        dense_weight = ops_module._dequantize_q8_weight_portable(qweight, torch.bfloat16)
+        expected = torch.nn.functional.linear(inputs, dense_weight, layer.bias)
+        parent_linear = type(layer).__mro__[1]
+        ops_module.q8_execution_stats(reset=True)
+
+        with mock.patch.object(
+            parent_linear,
+            "forward",
+            side_effect=RuntimeError("simulated TensorWiseINT8 kernel failure"),
+        ):
+            actual = layer(inputs)
+            repeated = layer(inputs)
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-3, rtol=1e-3))
+        self.assertTrue(torch.allclose(repeated, expected, atol=1e-3, rtol=1e-3))
+        self.assertEqual(
+            ops_module.q8_execution_stats(),
+            {"native_calls": 0, "fallback_calls": 2},
+        )
+
+
+class Qwen3VLLoaderRoutingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.nodes = nodes_factory()
+
+    def test_legacy_static_loader_rejects_q8_cr_with_dynamic_loader_guidance(self):
+        progress = mock.Mock()
+        with mock.patch.object(
+            self.nodes,
+            "GGUFLoadProgress",
+            return_value=progress,
+        ), mock.patch.object(
+            self.nodes,
+            "gguf_clip_loader",
+            return_value=(
+                {},
+                {
+                    "arch_str": "qwen3vl",
+                    "qwen3vl_text_only": True,
+                    "gguf_quant_formats": frozenset({"int8_tensorwise"}),
+                },
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Q8_CR text encoders require CLIPLoaderGGUFDynamicVRAM",
+            ):
+                self.nodes.CLIPLoaderGGUF().load_data(["qwen3vl-q8.gguf"])
+
+    def test_prunes_vision_tower_and_rejects_image_embeds(self):
+        class Qwen3VLFake(torch.nn.Module):
+            model_type = "qwen3vl_4b"
+
+            def __init__(self):
+                super().__init__()
+                self.visual = torch.nn.Linear(2, 2)
+
+        wrapper = torch.nn.Module()
+        wrapper.qwen3vl = Qwen3VLFake()
+        clip = type("Clip", (), {"cond_stage_model": wrapper})()
+
+        self.nodes._prune_qwen3vl_vision(clip)
+
+        self.assertIsNone(wrapper.qwen3vl.visual)
+        with self.assertRaisesRegex(ValueError, "text-only and does not support image inputs"):
+            wrapper.qwen3vl.preprocess_embed({"type": "image"}, device=torch.device("cpu"))
+
+    def test_ampere_feature_probe_selects_tensorwise_int8(self):
+        with mock.patch.object(
+            self.nodes.comfy.model_management,
+            "get_torch_device",
+            return_value=torch.device("cuda:0"),
+        ), mock.patch.object(self.nodes.torch.cuda, "is_available", return_value=True), mock.patch.object(
+            self.nodes.torch.cuda,
+            "get_device_capability",
+            return_value=(8, 6),
+        ), mock.patch.object(
+            self.nodes.comfy.quant_ops.TensorWiseINT8Layout,
+            "supports_fast_matmul",
+            return_value=True,
+        ):
+            selected, reason = self.nodes._qwen3vl_native_q8_device()
+
+        self.assertEqual(selected, (torch.device("cuda:0"), (8, 6)))
+        self.assertIsNone(reason)
+
+
 class Qwen3VLDetectionMarkerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1296,6 +1881,38 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
             state_dict["model.visual.merger.linear_fc2.weight"].shape,
             (4096, 4608),
         )
+
+    def test_text_only_q8_metadata_skips_mmproj_and_is_returned(self):
+        with mock.patch.object(
+            self.loader,
+            "gguf_sd_loader",
+            return_value=(
+                {
+                    "model.layers.0.input_layernorm.weight": torch.zeros(2560),
+                    "blk.0.attn_q.weight": torch.zeros((8, 2560), dtype=torch.int8),
+                },
+                {
+                    "arch_str": "qwen3vl",
+                    "metadata": {
+                        "comfy.gguf.qwen3vl.text_only": True,
+                        "comfy.gguf.qwen3vl.variant": "4b",
+                    },
+                    "gguf_quant_formats": frozenset({"int8_tensorwise"}),
+                },
+            ),
+        ), mock.patch.object(
+            self.loader,
+            "gguf_mmproj_loader",
+            return_value={},
+        ) as mmproj_loader:
+            state_dict, extra = self.loader.gguf_clip_loader(
+                "qwen3vl-4b-text-only.gguf",
+                return_extra=True,
+            )
+
+        self.assertTrue(extra["qwen3vl_text_only"])
+        self.assertIn("model.visual.deepstack_merger_list.0.norm.weight", state_dict)
+        mmproj_loader.assert_not_called()
 
     def test_pruned_32b_clip_loader_injects_marker(self):
         with mock.patch.object(

@@ -33,6 +33,49 @@ _FP8_DTYPES = {
     getattr(torch, "float8_e5m2", None),
 } - {None}
 RAW_BYTE_TENSOR_KEYS = frozenset(("tokenizer_json", "spiece_model", "tekken_model"))
+QWEN3VL_SOURCE_PREFIX = "model.language_model."
+QWEN3VL_VISUAL_PREFIX = "model.visual."
+QWEN3VL_TEXT_ONLY_METADATA = "comfy.gguf.qwen3vl.text_only"
+QWEN3VL_VARIANT_METADATA = "comfy.gguf.qwen3vl.variant"
+QWEN3VL_SOURCE_LANGUAGE_TENSOR_COUNT = 398
+QWEN3VL_SOURCE_VISUAL_TENSOR_COUNT = 315
+QWEN3VL_SOURCE_TENSOR_COUNT = 713
+QWEN3VL_LANGUAGE_SHAPES = {
+    f"{QWEN3VL_SOURCE_PREFIX}embed_tokens.weight": (151936, 2560),
+    f"{QWEN3VL_SOURCE_PREFIX}norm.weight": (2560,),
+}
+for _layer_index in range(36):
+    for _suffix, _shape in {
+        "input_layernorm.weight": (2560,),
+        "post_attention_layernorm.weight": (2560,),
+        "self_attn.k_norm.weight": (128,),
+        "self_attn.q_norm.weight": (128,),
+        "self_attn.k_proj.weight": (1024, 2560),
+        "self_attn.q_proj.weight": (4096, 2560),
+        "self_attn.v_proj.weight": (1024, 2560),
+        "self_attn.o_proj.weight": (2560, 4096),
+        "mlp.down_proj.weight": (2560, 9728),
+        "mlp.gate_proj.weight": (9728, 2560),
+        "mlp.up_proj.weight": (9728, 2560),
+    }.items():
+        QWEN3VL_LANGUAGE_SHAPES[
+            f"{QWEN3VL_SOURCE_PREFIX}layers.{_layer_index}.{_suffix}"
+        ] = _shape
+QWEN3VL_VISUAL_SIGNATURE_SHAPES = {
+    f"{QWEN3VL_VISUAL_PREFIX}patch_embed.proj.weight": (1024, 3, 2, 16, 16),
+    f"{QWEN3VL_VISUAL_PREFIX}pos_embed.weight": (2304, 1024),
+    f"{QWEN3VL_VISUAL_PREFIX}blocks.0.attn.qkv.weight": (3072, 1024),
+    f"{QWEN3VL_VISUAL_PREFIX}merger.linear_fc2.weight": (2560, 4096),
+    f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.0.norm.weight": (4096,),
+    f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.2.linear_fc2.weight": (2560, 4096),
+}
+
+
+class SourceStateDict(OrderedDict):
+    def __init__(self, *args, architecture_hint=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.architecture_hint = architecture_hint
+
 
 class ModelTemplate:
     arch = "invalid"  # string describing architecture
@@ -373,6 +416,27 @@ class ModelMiniMaxMusic3TextEncoder(ModelTemplate):
     ]
 
 
+class ModelQwen3VL(ModelTemplate):
+    arch = "qwen3vl"
+    keys_detect = [
+        (
+            f"{QWEN3VL_SOURCE_PREFIX}layers.0.self_attn.q_proj.weight",
+            f"{QWEN3VL_SOURCE_PREFIX}layers.35.self_attn.q_proj.weight",
+            f"{QWEN3VL_VISUAL_PREFIX}patch_embed.proj.weight",
+            f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.2.linear_fc2.weight",
+        )
+    ]
+    keys_noquant = [
+        "token_embd",
+        "output_norm",
+        "attn_norm",
+        "ffn_norm",
+        "attn_q_norm",
+        "attn_k_norm",
+    ]
+    keys_ignore = []
+
+
 class ModelQwen3(ModelTemplate):
     arch = "qwen3"
     keys_detect = [
@@ -427,7 +491,7 @@ class ModelQwenImage21(ModelTemplate):
 arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
              ModelLTXV, ModelLTXVUpsampler, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
              ModelKrea2, ModelIdeogram, ModelMinimaxH3, ModelMinimaxH3VAE,
-             ModelMiniMaxMusic3DiT, ModelMiniMaxMusic3TextEncoder, ModelQwen3,
+             ModelMiniMaxMusic3DiT, ModelMiniMaxMusic3TextEncoder, ModelQwen3, ModelQwen3VL,
              ModelQwenImage21]
 
 QWEN3_HF_KEY_MAP = {
@@ -464,6 +528,123 @@ def map_qwen3_state_dict(state_dict):
         mapped[new_key] = value
     return mapped
 
+
+def normalize_qwen3vl_state_dict(state_dict):
+    """Validate and extract the official BF16 Qwen3-VL 4B language encoder."""
+    keys = set(state_dict)
+    if not any(key.startswith(QWEN3VL_SOURCE_PREFIX) for key in keys):
+        return None
+    embedding_key = f"{QWEN3VL_SOURCE_PREFIX}embed_tokens.weight"
+    layer_35_key = f"{QWEN3VL_SOURCE_PREFIX}layers.35.self_attn.q_proj.weight"
+    if embedding_key not in keys or layer_35_key not in keys:
+        raise ValueError(
+            "Only the official Qwen3-VL 4B BF16 checkpoint is supported; "
+            "the language-model key layout is incompatible."
+        )
+    if not any(key.startswith(QWEN3VL_VISUAL_PREFIX) for key in keys):
+        raise ValueError(
+            "Qwen3-VL 4B conversion requires the original checkpoint with both "
+            "language and visual tensors; text-only inputs are not a supported source."
+        )
+
+    expected_shapes = QWEN3VL_LANGUAGE_SHAPES
+    language_keys = {
+        key for key in keys if key.startswith(QWEN3VL_SOURCE_PREFIX)
+    }
+    unexpected = sorted(language_keys - expected_shapes.keys())
+    missing = sorted(expected_shapes.keys() - language_keys)
+    visual_keys = {key for key in keys if key.startswith(QWEN3VL_VISUAL_PREFIX)}
+    unsupported_prefixes = sorted(
+        key for key in keys
+        if not key.startswith((QWEN3VL_SOURCE_PREFIX, QWEN3VL_VISUAL_PREFIX))
+    )
+    expected_counts = (
+        QWEN3VL_SOURCE_LANGUAGE_TENSOR_COUNT,
+        QWEN3VL_SOURCE_VISUAL_TENSOR_COUNT,
+        QWEN3VL_SOURCE_TENSOR_COUNT,
+    )
+    actual_counts = (len(language_keys), len(visual_keys), len(keys))
+    if unexpected or missing or unsupported_prefixes or actual_counts != expected_counts:
+        details = []
+        if actual_counts != expected_counts:
+            details.append(
+                "tensor counts differ from the official 4B layout "
+                f"(language={len(language_keys)}, visual={len(visual_keys)}, total={len(keys)})"
+            )
+        if missing:
+            details.append(f"missing language tensors: {', '.join(missing[:5])}")
+        if unexpected:
+            details.append(f"unexpected language tensors: {', '.join(unexpected[:5])}")
+        if unsupported_prefixes:
+            details.append(f"unsupported tensor names: {', '.join(unsupported_prefixes[:5])}")
+        raise ValueError(
+            "Only the official Qwen3-VL 4B BF16 checkpoint layout is supported; "
+            + "; ".join(details)
+        )
+
+    non_bf16 = sorted(
+        (key, str(value.dtype))
+        for key, value in state_dict.items()
+        if value.dtype != torch.bfloat16
+    )
+    if non_bf16:
+        key, dtype = non_bf16[0]
+        raise ValueError(
+            "Qwen3-VL 4B conversion accepts BF16 tensors only; "
+            f"{key!r} has dtype {dtype}."
+        )
+
+    for key, expected_shape in expected_shapes.items():
+        actual_shape = tuple(state_dict[key].shape)
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"Unsupported Qwen3-VL 4B tensor shape for {key!r}: "
+                f"expected {expected_shape}, got {actual_shape}."
+            )
+    for key, expected_shape in QWEN3VL_VISUAL_SIGNATURE_SHAPES.items():
+        if key not in state_dict or tuple(state_dict[key].shape) != expected_shape:
+            actual_shape = tuple(state_dict[key].shape) if key in state_dict else None
+            raise ValueError(
+                f"Unsupported Qwen3-VL 4B visual signature for {key!r}: "
+                f"expected {expected_shape}, got {actual_shape}."
+            )
+
+    hf_state_dict = OrderedDict(
+        (key[len(QWEN3VL_SOURCE_PREFIX):], value)
+        for key, value in state_dict.items()
+        if key.startswith(QWEN3VL_SOURCE_PREFIX)
+    )
+    return SourceStateDict(
+        map_qwen3_state_dict(hf_state_dict).items(),
+        architecture_hint="qwen3vl",
+    )
+
+
+def normalize_source_state_dict(state_dict):
+    if isinstance(state_dict, SourceStateDict):
+        return state_dict
+    qwen3vl_state_dict = normalize_qwen3vl_state_dict(state_dict)
+    if qwen3vl_state_dict is not None:
+        return qwen3vl_state_dict
+    return SourceStateDict(
+        map_qwen3_state_dict(strip_prefix(state_dict)).items()
+    )
+
+
+def validate_qwen3vl_quantization(model_arch, quant_type_name, max_size_mb):
+    if model_arch.arch == "qwen3vl" and (quant_type_name != "Q8_CR" or max_size_mb is not None):
+        raise ValueError(
+            "Qwen3-VL 4B BF16 conversion is currently supported only as a text-only "
+            "Q8_CR GGUF. Select Q8_CR and leave max_size_mb unset."
+        )
+
+
+def add_model_metadata(writer, model_arch):
+    if model_arch.arch == "qwen3vl":
+        writer.add_bool(QWEN3VL_TEXT_ONLY_METADATA, True)
+        writer.add_string(QWEN3VL_VARIANT_METADATA, "4b")
+
+
 def is_model_arch(model, state_dict):
     # check if model is correct
     matched = False
@@ -483,6 +664,17 @@ def is_model_arch(model, state_dict):
     return matched
 
 def detect_arch(state_dict):
+    architecture_hint = getattr(state_dict, "architecture_hint", None)
+    if architecture_hint == "qwen3vl":
+        return ModelQwen3VL()
+    if architecture_hint is not None:
+        raise ValueError(f"Unknown source architecture hint: {architecture_hint!r}.")
+
+    if any(key.startswith(QWEN3VL_SOURCE_PREFIX) for key in state_dict):
+        normalized = normalize_qwen3vl_state_dict(state_dict)
+        if normalized is not None:
+            return ModelQwen3VL()
+
     model_arch = None
     for arch in arch_list:
         if is_model_arch(arch, state_dict):
@@ -1187,7 +1379,7 @@ def quantize_k(data, qtype):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Convert diffusion model safetensors/ckpt to GGUF."
+        description="Convert supported diffusion or text-encoder checkpoints to GGUF."
         " By default produces an F16/BF16 GGUF; use --quant-type to quantize."
     )
     parser.add_argument("--src", required=True, help="Source model ckpt/safetensors file.")
@@ -1220,10 +1412,11 @@ def parse_args():
         choices=list(QUANT_TYPE_MAP.keys()),
         default=None,
         help=(
-            "Target quantization type for eligible 2-D+ tensors. Raw Q4_K/Q5_K/Q6_K "
-            "are uniform; Q4_K_S/Q4_K_M/Q5_K_S/Q5_K_M are deterministic mixed "
-            "presets. 1-D biases/scales stay F32. Defaults to F16/BF16 matching "
-            "the source dtype."
+            "Target quantization type for eligible 2-D+ tensors. Qwen3-VL 4B BF16 "
+            "conversion currently requires Q8_CR and produces a text-only encoder. "
+            "Raw Q4_K/Q5_K/Q6_K are uniform; Q4_K_S/Q4_K_M/Q5_K_S/Q5_K_M are "
+            "deterministic mixed presets. 1-D biases/scales stay F32. Defaults to "
+            "F16/BF16 matching the source dtype."
         ),
     )
     parser.add_argument(
@@ -1328,7 +1521,7 @@ def load_state_dict(path, progress_callback=None):
                 if progress_callback is not None:
                     progress_callback("read", index, len(keys))
 
-    return map_qwen3_state_dict(strip_prefix(state_dict))
+    return normalize_source_state_dict(state_dict)
 
 def load_safetensors_metadata(path):
     if not path.endswith(".safetensors"):
@@ -1779,7 +1972,7 @@ def _streamed_safetensors_layout(path):
             source_layout[key] = torch.empty(
                 tuple(tensor_slice.get_shape()), dtype=dtype, device="meta"
             )
-    layout = map_qwen3_state_dict(strip_prefix(source_layout))
+    layout = normalize_source_state_dict(source_layout)
     source_keys = {id(value): key for key, value in source_layout.items()}
     return layout, {key: source_keys[id(value)] for key, value in layout.items()}
 
@@ -1810,6 +2003,7 @@ def convert_safetensors_streamed(
     model_arch = detect_arch(state_dict)
     logging.info(f"* Architecture detected from input: {model_arch.arch}")
     validate_key_patterns(model_arch, state_dict)
+    validate_qwen3vl_quantization(model_arch, quant_type_name, max_size_mb)
     if max_size_mb is not None and quant_type_name not in (None, TARGET_SIZE_QUANT_TYPE):
         raise ValueError("--max-size-mb cannot be combined with --quant-type.")
 
@@ -1872,6 +2066,7 @@ def convert_safetensors_streamed(
     writer = gguf.GGUFWriter(path=None, arch=model_arch.arch, use_temp_file=True)
     writer.temp_file = tempfile.TemporaryFile(mode="w+b")
     writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
+    add_model_metadata(writer, model_arch)
     if ftype_gguf is not None:
         writer.add_file_type(ftype_gguf)
     if "config" in source_metadata:
@@ -1950,11 +2145,13 @@ def convert_state_dict(
     quantization_device="auto",
     progress_callback=None,
 ):
-    """Convert an already loaded, prefix-normalized diffusion-model state dict."""
+    """Convert an already loaded, prefix-normalized model state dict."""
     source_metadata = source_metadata or {}
+    state_dict = normalize_source_state_dict(state_dict)
     model_arch = detect_arch(state_dict)
     logging.info(f"* Architecture detected from input: {model_arch.arch}")
     validate_key_patterns(model_arch, state_dict)
+    validate_qwen3vl_quantization(model_arch, quant_type_name, max_size_mb)
 
     if max_size_mb is not None and quant_type_name not in (None, TARGET_SIZE_QUANT_TYPE):
         raise ValueError("--max-size-mb cannot be combined with --quant-type.")
@@ -2017,6 +2214,7 @@ def convert_state_dict(
     # handle actual file
     writer = gguf.GGUFWriter(path=None, arch=model_arch.arch)
     writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
+    add_model_metadata(writer, model_arch)
     if ftype_gguf is not None:
         writer.add_file_type(ftype_gguf)
     if "config" in source_metadata:

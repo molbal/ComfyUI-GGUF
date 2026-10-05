@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 
 import gguf
@@ -40,14 +41,28 @@ def _read_int8_quant_config(state_dict, weight_key):
         ) from error
 
 
-def _unrotate_convrot_weight(weight, group_size):
-    from comfy_kitchen.tensor.int8_utils import _build_hadamard
+def _build_convrot_hadamard(size, device, dtype):
+    if size < 4 or size & (size - 1) or math.log(size, 4) % 1:
+        raise ValueError(f"Regular ConvRot Hadamard size must be a power of 4, got {size}.")
+    h4 = torch.tensor(
+        [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+        dtype=dtype,
+        device=device,
+    )
+    h = h4
+    current_size = 4
+    while current_size < size:
+        h = torch.kron(h, h4)
+        current_size *= 4
+    return h / (size ** 0.5)
 
+
+def _unrotate_convrot_weight(weight, group_size):
     if group_size <= 0 or weight.shape[1] % group_size:
         raise ValueError(
             f"ConvRot group size {group_size} does not divide weight shape {tuple(weight.shape)}."
         )
-    hadamard = _build_hadamard(group_size, device=weight.device, dtype=weight.dtype)
+    hadamard = _build_convrot_hadamard(group_size, device=weight.device, dtype=weight.dtype)
     return torch.matmul(
         weight.reshape(weight.shape[0], -1, group_size),
         hadamard,

@@ -16,6 +16,13 @@ IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltx
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "qwen35", "gemma3", "gemma4", "minimax_music3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 RAW_BYTE_TENSOR_KEYS = frozenset(("tokenizer_json", "spiece_model", "tekken_model"))
+QWEN3VL_TEXT_ONLY_METADATA = "comfy.gguf.qwen3vl.text_only"
+QWEN3VL_VARIANT_METADATA = "comfy.gguf.qwen3vl.variant"
+GGUF_FLOAT32_TYPE = getattr(
+    gguf.GGUFValueType,
+    "FLOAT32",
+    getattr(gguf.GGUFValueType, "F32", None),
+)
 
 def device_supports_bf16():
     """
@@ -98,14 +105,18 @@ def get_gguf_metadata(reader):
         try:
             field = reader.get_field(field_name)
             if len(field.types) == 1:  # Simple scalar fields only
+                value = field.parts[field.data[-1]]
                 if field.types[0] == gguf.GGUFValueType.STRING:
-                    metadata[field_name] = str(field.parts[field.data[-1]], "utf-8")
-                elif field.types[0] == gguf.GGUFValueType.INT32:
-                    metadata[field_name] = int(field.parts[field.data[-1]])
-                elif field.types[0] == gguf.GGUFValueType.F32:
-                    metadata[field_name] = float(field.parts[field.data[-1]])
+                    metadata[field_name] = str(value, "utf-8")
+                    continue
+                if hasattr(value, "item"):
+                    value = value.item()
+                if field.types[0] == gguf.GGUFValueType.INT32:
+                    metadata[field_name] = int(value)
+                elif GGUF_FLOAT32_TYPE is not None and field.types[0] == GGUF_FLOAT32_TYPE:
+                    metadata[field_name] = float(value)
                 elif field.types[0] == gguf.GGUFValueType.BOOL:
-                    metadata[field_name] = bool(field.parts[field.data[-1]])
+                    metadata[field_name] = bool(value)
         except:
             continue
     return metadata
@@ -278,7 +289,10 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
     # extra info to return
     extra = {
         "arch_str": arch_str,
-        "metadata": get_gguf_metadata(reader)
+        "metadata": get_gguf_metadata(reader),
+        "gguf_quant_formats": frozenset(
+            quant_conf.get("format") for quant_conf in custom_quant_configs.values()
+        ),
     }
 
     # Detect custom ComfyUI native quantization metadata
@@ -990,7 +1004,7 @@ def inject_qwen3vl_detection_markers(sd):
         merge_dim,
     )
 
-def gguf_clip_loader(path, dynamic=False, progress_callback=None):
+def gguf_clip_loader(path, dynamic=False, progress_callback=None, return_extra=False):
     sd, extra = gguf_sd_loader(
         path,
         is_text_model=True,
@@ -998,6 +1012,15 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None):
         progress_callback=progress_callback,
     )
     arch = extra.get("arch_str", None)
+    metadata = extra.get("metadata", {})
+    qwen3vl_text_only = metadata.get(QWEN3VL_TEXT_ONLY_METADATA) is True
+    if qwen3vl_text_only and (
+        arch != "qwen3vl" or metadata.get(QWEN3VL_VARIANT_METADATA) != "4b"
+    ):
+        raise ValueError(
+            "Qwen3-VL text-only metadata is valid only on a Qwen3-VL 4B GGUF."
+        )
+    extra["qwen3vl_text_only"] = qwen3vl_text_only
     if arch == "minimax_music3" and "tokenizer_json" in sd:
         sd["tokenizer_json"] = normalize_raw_byte_tensor(sd["tokenizer_json"])
     if arch in {"t5", "t5encoder"}:
@@ -1043,7 +1066,7 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None):
             vsd = gguf_mmproj_loader(path)
             sd.update(vsd)
         if arch == "qwen3vl":
-            vsd = gguf_mmproj_loader(path)
+            vsd = {} if qwen3vl_text_only else gguf_mmproj_loader(path)
             if vsd and "model.layers.49.self_attn.q_proj.weight" in sd:
                 # MiniMax H3 receives the Qwen3-VL vision tower under
                 # ``visual.*``, unlike the standalone Qwen3-VL variants.
@@ -1091,4 +1114,4 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None):
         logging.info(f"Dequantized {dequantized_count} tensors for Ideogram model ({target_dtype})")
     else:
         pass
-    return sd
+    return (sd, extra) if return_extra else sd
