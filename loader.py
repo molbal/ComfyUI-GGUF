@@ -718,16 +718,22 @@ def gguf_mmproj_loader(path):
     tenc = strip_quant_suffix(tenc)
 
     # try and find matching mmproj
-    target = []
     root = os.path.dirname(path)
+    sidecars = []
     for fname in os.listdir(root):
         name, ext = os.path.splitext(fname)
-        if ext.lower() != ".gguf":
-            continue
-        if "mmproj" not in name.lower():
-            continue
-        if tenc in name.lower():
-            target.append(fname)
+        if ext.lower() == ".gguf" and "mmproj" in name.lower():
+            sidecars.append(fname)
+    target = [fname for fname in sidecars if tenc in fname.lower()]
+
+    if len(target) == 0 and tenc.startswith("qwen3-vl-"):
+        alias = tenc.replace("qwen3-vl-", "qwen3vl-", 1)
+        target = [fname for fname in sidecars if alias in fname.lower()]
+        if len(target) > 1:
+            raise ValueError(
+                f"Ambiguous Qwen3-VL mmproj for text encoder '{tenc_fname}': "
+                f"{', '.join(sorted(target))}. Keep only one matching projector."
+            )
 
     if len(target) == 0:
         logging.error(f"Error: Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}')! Qwen-Image-Edit will be broken!")

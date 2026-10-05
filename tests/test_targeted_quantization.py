@@ -2014,6 +2014,38 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
         self.assertTrue(torch.equal(weight[:, :, 0], patch_a))
         self.assertTrue(torch.equal(weight[:, :, 1], patch_b))
 
+    def test_qwen3vl_mmproj_lookup_matches_hyphenated_encoder_name(self):
+        with TemporaryDirectory() as temp_dir:
+            text_encoder = Path(temp_dir) / "Qwen3-VL-8B-Instruct-Q4_K_M.gguf"
+            matching_mmproj = Path(temp_dir) / "mmproj-Qwen3VL-8B-Instruct-F16.gguf"
+            other_variant = Path(temp_dir) / "mmproj-Qwen3VL-4B-Instruct-F16.gguf"
+            text_encoder.touch()
+            matching_mmproj.touch()
+            other_variant.touch()
+
+            with mock.patch.object(
+                self.loader,
+                "gguf_sd_loader",
+                return_value=({"v.deepstack.0.norm.weight": torch.ones(8)}, {}),
+            ) as sd_loader:
+                mapped = self.loader.gguf_mmproj_loader(str(text_encoder))
+
+        sd_loader.assert_called_once_with(str(matching_mmproj), is_text_model=True)
+        self.assertIn("model.visual.deepstack_merger_list.0.norm.weight", mapped)
+
+    def test_qwen3vl_mmproj_lookup_rejects_ambiguous_alias_matches(self):
+        with TemporaryDirectory() as temp_dir:
+            text_encoder = Path(temp_dir) / "Qwen3-VL-8B-Instruct-Q4_K_M.gguf"
+            text_encoder.touch()
+            for suffix in ("F16", "BF16"):
+                (Path(temp_dir) / f"mmproj-Qwen3VL-8B-Instruct-{suffix}.gguf").touch()
+
+            with mock.patch.object(self.loader, "gguf_sd_loader") as sd_loader:
+                with self.assertRaisesRegex(ValueError, "Ambiguous Qwen3-VL mmproj"):
+                    self.loader.gguf_mmproj_loader(str(text_encoder))
+
+        sd_loader.assert_not_called()
+
 
 class Qwen35GGUFLoaderTests(unittest.TestCase):
     @classmethod
