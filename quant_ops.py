@@ -87,7 +87,11 @@ def _physical_weight_shape(weight):
 
 
 def _try_native_linear(input_tensor, weight, bias):
-    if not _is_ggml_qtensor(weight) or weight._params.transposed:
+    if (
+        not _is_ggml_qtensor(weight)
+        or weight._params.transposed
+        or weight._params.orig_dtype != input_tensor.dtype
+    ):
         return None
     qtype = gguf.GGMLQuantizationType(weight._params.tensor_type)
     return try_kquant_linear(
@@ -96,6 +100,7 @@ def _try_native_linear(input_tensor, weight, bias):
         qtype,
         _physical_weight_shape(weight),
         bias,
+        dequant_dtype=None,
     )
 
 

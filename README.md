@@ -162,7 +162,10 @@ the repository’s reference dequantizer. K-quant inference uses the portable
 dequantization path by default. The experimental bundled Triton/CUDA Linear
 backend is opt-in with `COMFYUI_GGUF_KQUANT_BACKEND=bundled`; validate both
 output and performance on your hardware before enabling it. Its current
-shape-aware configs are limited to a few benchmarked LTX Q5_K/Q6_K matrix
-shapes and activation sizes; every other route stays on portable PyTorch. This
+implementation accelerates decoding, then uses the same PyTorch Linear as the
+portable path, including the loader's decode precision and bias behavior.
+It still materializes a floating-point weight. Its configs are limited to SM
+8.6, a few benchmarked LTX Q5_K/Q6_K matrix shapes, and at most 1024 activation
+rows; every other route stays on portable PyTorch. This
 is a local RTX 3080 Laptop tuning result, not an RTX 5090 or end-to-end speed
 claim. See [K-quant inference notes](docs/k-quant-inference.md) for details.

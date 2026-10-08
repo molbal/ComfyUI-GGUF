@@ -7,8 +7,9 @@ footprint. Standard GGML weights use the portable dequantization path by
 default. Q4_K, Q5_K, and Q6_K Linear weights can instead use the experimental
 bundled Triton backend on CUDA, but only when explicitly enabled with
 `COMFYUI_GGUF_KQUANT_BACKEND=bundled`. It receives the original GGUF blocks
-directly and fuses unpacking/dequantization with a floating-point matrix
-multiply; it is not low-bit arithmetic. Unsupported routes fall back to the
+directly and accelerates unpacking/dequantization, followed by the same
+PyTorch `Linear` as the portable path; it is not low-bit arithmetic and still
+materializes a floating-point weight. Unsupported routes fall back to the
 reference path. Leave the backend disabled unless its output and performance
 have been validated on the target GPU and workflow; no universal speedup
 should be assumed.
@@ -19,47 +20,80 @@ about 2.2x slower for t2v on Windows with an RTX 5090 (SM 12.0) and
 `triton-windows 3.6.0.post26`; outputs also differed from the portable path.
 Keep it disabled on that setup until a compatible backend is validated.
 
-Local investigation on an RTX 3080 Laptop (SM 8.6, PyTorch 2.14.0+cu130,
-Triton 3.1.0) found that the bundled kernel's default staging could produce
+Earlier investigation on an RTX 3080 Laptop (SM 8.6, PyTorch 2.14.0+cu130,
+Triton 3.1.0) found that the fused kernel's default staging could produce
 intermittently incorrect Q6_K outputs on one-hot probes of a real Qwen3 weight.
 Setting `num_stages=1` removed the observed variation and matched the portable
-dequantized weights exactly in those probes. The kernel now uses one stage and
-rounds its decoded K-quant intermediates to the activation dtype to follow the
-portable decoder. This aligns decoded weights, but the fused matrix-multiply
-accumulation can still differ numerically from PyTorch's `Linear`. Compute
+dequantized weights exactly in those probes. Rounding decoded intermediates
+to the activation dtype matched an explicit `target` decode reference, but
+did not preserve the loader's default FP16 decoding with BF16 activations.
+Even with identical decoded weights, the fused matrix multiply and bias
+handling differed from PyTorch's `Linear`. Compute
 Sanitizer racecheck reported no hazards for the one-stage Q4_K/Q5_K/Q6_K test
 cases.
 
-A local RTX 3080 Laptop BF16 tile sweep used the downloaded LTX 2.3 Q5_K_M
-weights and compared the fused kernel against portable dequantization plus
-`Linear`. The table shows selected representative shapes, not full-workflow
-latency:
+Larger fused matmul tiles reduced the original slowdown, but did not solve
+output equivalence. One reduced i2v run (256x256 latent, 9 frames, one denoise
+step per stage) took 152.88 s with the tuned fused route versus 153.87 s with
+the backend off; mean frame PSNR was 39.9 dB, not identical output.
 
-| GGUF layer shape `(N, K)` | Activation rows `M` | Portable (ms) | Selected Triton tile `(BM, BN, BK)` (ms) |
-| --- | ---: | ---: | ---: |
-| Q5_K `(16384, 4096)` FFN up | 16 | 6.63 | `(64, 32, 32)` 4.41 |
-| Q5_K `(16384, 4096)` FFN up | 128 | 5.82 | `(128, 32, 32)` 3.43 |
-| Q5_K `(16384, 4096)` FFN up | 256 | 7.09 | `(256, 32, 32)` 3.84 |
-| Q5_K `(4096, 4096)` attention | 128 | 2.15 | `(128, 32, 32)` 1.08 |
-| Q5_K `(4096, 4096)` attention | 256 | 2.79 | `(256, 32, 32)` 1.24 |
-| Q6_K `(4096, 16384)` FFN down | 128 | 5.98 | `(128, 32, 32)` 2.06 |
-| Q6_K `(4096, 16384)` FFN down | 256 | 6.18 | `(256, 32, 32)` 3.03 |
-| Q6_K `(4096, 16384)` FFN down | 512 | 8.70 | `(256, 32, 32)` 6.58 |
+The next round replaced the fused matmul with a single Triton decoding pass
+and reference PyTorch `Linear`. This preserves PyTorch's accumulation, bias,
+and reduced-precision settings rather than trying to reproduce cuBLAS in a
+custom matmul. Decoder intermediates round to the requested decode dtype,
+including FP16 for the default and Dynamic VRAM paths, before casting to the
+activation dtype. FP32 fusion is disabled to preserve the reference's
+separate multiplication and subtraction.
 
-These warm microbenchmarks motivated narrow shape-and-`M` dispatch. The old
-`BM=16` tile regressed sharply on these matrix sizes; larger tiles often
-reduced the cost, while some larger `BN`/`BK` variants spilled registers and
-lost. The candidate routes only the listed Q5_K/Q6_K shapes and tested BF16 or
-FP16 activations up to conservative `M` limits (Q5_K FFN-up and attention
-through `M=256`, Q6_K FFN-down through `M=512`); unsupported cases use the
-portable path. The optimized selection has not been measured on the reporter's
-RTX 5090 or in a full LTX run and remains opt-in. Do not treat these layer
-results as a 5090 or end-to-end speed claim. In one matched reduced i2v run
-using a 256x256 latent, 9 frames, and one denoise step per stage, the tuned
-route took 152.88 s versus 153.87 s with the backend disabled. The outputs
-were not identical (mean frame PSNR 39.9 dB). This single RTX 3080 Laptop run
-is within normal timing noise, does not prove an end-to-end gain, and is not
-sufficient to claim output equivalence or release the backend as a default.
+An alternating warm sweep used real LTX weights, CUDA events, five warmups,
+and 21 measurements per implementation per case. It covered three layers,
+FP16/BF16 activations, default/activation decode precision, and seven row
+counts from 1 to 1024: 84 cases. Every candidate output was bit-identical to
+the corresponding portable `Linear`; every candidate case was faster than
+portable, with the smallest measured speedup 1.52x. Representative BF16
+activation/BF16 decode results are below. These are layer timings, not
+full-workflow latency:
+
+| GGUF layer shape `(N, K)` | Rows `M` | Portable (ms) | Previous tuned fused (ms) | Triton decode + PyTorch Linear (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Q5_K `(4096, 4096)` attention | 128 | 2.71 | 1.11 | 0.50 |
+| Q5_K `(4096, 4096)` attention | 256 | 2.38 | 1.16 | 0.59 |
+| Q5_K `(16384, 4096)` FFN up | 128 | 6.95 | 4.00 | 1.63 |
+| Q5_K `(16384, 4096)` FFN up | 256 | 7.23 | 4.43 | 2.12 |
+| Q6_K `(4096, 16384)` FFN down | 128 | 7.33 | 2.76 | 1.95 |
+| Q6_K `(4096, 16384)` FFN down | 512 | 11.30 | 7.89 | 4.83 |
+
+Current dispatch permits only these three matrix shapes, FP16/BF16
+activations, CUDA SM 8.6, and 1 through 1024 activation rows. Q4_K is covered
+by decoder tests but not routed in production. Other GPU capabilities,
+including the reporter's SM 12.0 RTX 5090, use portable fallback even when
+`bundled` is selected. This is a local tuning result, not proof of a universal
+or city96-relative end-to-end speedup.
+
+Six reduced i2v executions of the reporter's KJ-loader graph used the same
+seed, example input, 256x256 initial latent, 9 output frames at 512x512, and
+one denoise step per stage. One portable and one candidate warmup preceded
+two alternating measured runs of each. Both sampled video latents and every
+decoded image element were bit-identical across all six executions, including
+the portable-versus-portable control; all captured tensors were finite.
+The candidate served 832 backend calls per execution without a failure
+fallback. Audio decoding and video encoding were omitted so compression
+could not hide or create output differences.
+
+| Warm reduced-workflow timing | Portable | Candidate |
+| --- | ---: | ---: |
+| ComfyUI prompt execution median | 103.29 s | 98.30 s |
+| Instrumented sampling/upscale/video-decode pipeline median | 48.93 s | 42.34 s |
+
+This is a measured 4.8% prompt-latency reduction in this reduced, cached-prompt
+workflow, with only two measured runs per route. It is not a full-resolution
+or RTX 5090 result and does not resolve the separate city96-relative
+text-encoder regression. The backend remains disabled by default. Nineteen
+focused backend tests passed, including actual static and Dynamic VRAM
+operations, and CUDA memcheck found no errors in the new decoder tests.
+An isolated decoder racecheck also reported zero hazards while Q4_K, Q5_K,
+and Q6_K results matched CPU references across FP16/BF16/FP32 decode precision
+and FP16/BF16 output precision.
 
 `_K` remains reasonable for text encoders when the compressed file or
 CPU/offload footprint is the primary constraint and the one-time text encoding
@@ -161,6 +195,17 @@ matrix. `linear` must return the same shape and device as
 dtype. Alternatively, the module can call `register_kquant_backend()` from
 [`kquant_backend.py`](../kquant_backend.py) while it imports.
 
+Precision-aware backends set `supports_dequant_dtype = True`; the dispatcher
+then also passes `dequant_dtype` to `linear()` and optional `should_use()`.
+It is a resolved `torch.dtype`, separate from the input/output dtype:
+`None` from a loader resolves to FP16 and `target` resolves to the activation
+dtype. Decode intermediates must use this precision before casting the
+completed weight. Backends without this capability keep their original
+signature, but are declined when decode and activation precision differ.
+Dynamic VRAM additionally declines acceleration when the stored logical
+weight dtype differs from the activation dtype, preserving the portable
+operation's dtype checks.
+
 The integration verifies the block-storage size and output contract. A
 backend's optional `should_use()` can decline particular shapes without
 blacklisting the route; this supports performance-based fallback. A backend
@@ -185,7 +230,7 @@ dequantize-then-FP16/BF16-matmul sequence for eligible Linear layers.
 | Diffusion denoising latency | Usually unfavorable: every sampling step revisits many layers and repeats unpacking. |
 | Text-encoder latency | May be acceptable because encoding occurs once per prompt, but measure it. |
 | Output quality at a size budget | Often better than legacy quants of comparable payload size, but architecture- and model-dependent. |
-| Fused K-quant Linear | Experimental and opt-in; fused unpacking/dequantization avoids a full expanded weight, but performs floating-point math. Other routes use the portable fallback. |
+| Accelerated K-quant Linear | Experimental and opt-in; Triton decoding still materializes a floating weight and uses reference PyTorch Linear. Other routes use the portable fallback. |
 
 The actual outcome also depends on GPU, CPU, PCIe bandwidth, batch/sequence
 size, ComfyUI offload policy, and whether the model is compute- or

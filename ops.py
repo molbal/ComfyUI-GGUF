@@ -537,6 +537,7 @@ class GGMLOps(comfy.ops.manual_cast):
                     weight_qtype,
                     getattr(weight, "tensor_shape", weight.shape),
                     bias,
+                    dequant_dtype=self.dequant_dtype,
                 )
                 if output is not None:
                     return output
