@@ -158,4 +158,11 @@ this converter and requires every selected row to be divisible by 256.
 Architecture-protected, convolution, small, and one-dimensional tensors retain
 higher precision. The local encoder is used even when the installed `gguf`
 Python package only supports reading K quants; output is still validated against
-the repository’s reference dequantizer.
+the repository’s reference dequantizer. K-quant inference uses the portable
+dequantization path by default. The experimental bundled Triton/CUDA Linear
+backend is opt-in with `COMFYUI_GGUF_KQUANT_BACKEND=bundled`; validate both
+output and performance on your hardware before enabling it. Its current
+shape-aware configs are limited to a few benchmarked LTX Q5_K/Q6_K matrix
+shapes and activation sizes; every other route stays on portable PyTorch. This
+is a local RTX 3080 Laptop tuning result, not an RTX 5090 or end-to-end speed
+claim. See [K-quant inference notes](docs/k-quant-inference.md) for details.

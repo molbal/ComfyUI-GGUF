@@ -1,5 +1,5 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
-"""Optional native Linear backend for GGML K-quant weights.
+"""Optional fused Linear backend for GGML K-quant weights.
 
 An accelerator package may either call :func:`register_kquant_backend` during
 import or expose ``linear`` (and optionally ``supports``) from the module named
@@ -24,7 +24,6 @@ SUPPORTED_K_QUANTS = frozenset(
     }
 )
 _BACKEND_ENV = "COMFYUI_GGUF_KQUANT_BACKEND"
-_DEFAULT_BACKEND_MODULE = "comfyui_gguf_kquant"
 _LOCAL_BACKEND_MODULE = ".kquant_triton_backend"
 _backend = None
 _backend_checked = False
@@ -64,9 +63,20 @@ def _load_backend():
             return _backend
 
         configured_module = os.environ.get(_BACKEND_ENV, "").strip()
-        candidates = [configured_module] if configured_module else [_DEFAULT_BACKEND_MODULE]
-        if not configured_module:
-            candidates.append(_LOCAL_BACKEND_MODULE)
+        if configured_module.lower() in {"", "none", "off", "disabled", "false"}:
+            _backend_checked = True
+            logging.info(
+                "ComfyUI-GGUF: optional K-quant backend is disabled; "
+                "set %s=bundled to enable the experimental Triton backend",
+                _BACKEND_ENV,
+            )
+            return None
+
+        candidates = (
+            [_LOCAL_BACKEND_MODULE]
+            if configured_module.lower() == "bundled"
+            else [configured_module]
+        )
         last_error = None
         for module_name in candidates:
             try:
@@ -141,6 +151,22 @@ def _backend_supports(backend, *, qtype, input_tensor, qdata, weight_shape):
     )
 
 
+def _backend_should_use(backend, *, qtype, input_tensor, qdata, weight_shape):
+    should_use = getattr(backend, "should_use", None)
+    if not callable(should_use):
+        return True
+    return bool(
+        should_use(
+            qtype=qtype.name,
+            device=input_tensor.device,
+            input_dtype=input_tensor.dtype,
+            input_shape=tuple(input_tensor.shape),
+            weight_shape=weight_shape,
+            weight_dtype=qdata.dtype,
+        )
+    )
+
+
 def try_kquant_linear(input_tensor, qdata, qtype, weight_shape, bias=None):
     """Return native Linear output, or ``None`` when fallback should be used."""
     if qtype not in SUPPORTED_K_QUANTS or not torch.is_tensor(qdata):
@@ -171,6 +197,12 @@ def try_kquant_linear(input_tensor, qdata, qtype, weight_shape, bias=None):
 
     try:
         if not _backend_supports(
+            backend,
+            qtype=qtype,
+            input_tensor=input_tensor,
+            qdata=qdata,
+            weight_shape=weight_shape,
+        ) or not _backend_should_use(
             backend,
             qtype=qtype,
             input_tensor=input_tensor,

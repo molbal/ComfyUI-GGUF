@@ -32,20 +32,26 @@ For Krea 2 and Ideogram 4 models on RTX 30-series architecture, `Q8_CR` offers s
 * High image fidelity expected from 8-bit quantization while shielding sensitive tensors.
 * Reduced VRAM pressure during complex multi-model spatial workflows.
 
-## Native GGML K-Quant Linear Execution
+## Experimental Fused GGML K-Quant Linear
 
 Standard `Q4_K`, `Q5_K`, and `Q6_K` tensors retain their packed GGUF bytes and
-can use the optional bundled Triton/CUDA backend for eligible 2-D Linear
+can use the experimental bundled Triton/CUDA backend for eligible 2-D Linear
 weights. The kernel decodes super-block scales, minima, and packed values while
-accumulating the matrix product, avoiding a full floating-point weight
-allocation on each forward. It supports FP16, BF16, and FP32 activations and
-rank-3 activation shapes after flattening the leading dimensions.
-
-The backend is loaded lazily so installations without Triton or CUDA continue
-to use the existing PyTorch dequantization path. Non-Linear operations,
-unsupported block alignment, active weight patches/LoRAs, and backend failures
-also use the reference path. `Q2_K`, `Q3_K`, `Q8_K`, IQ formats, and custom CR
-formats are intentionally outside this route.
+accumulating a floating-point matrix product, avoiding a full floating-point
+weight allocation on each forward. This fuses dequantization with the matmul. The current benchmark-gated
+selection uses FP16 or BF16 activations and rank-2/rank-3 shapes after flattening
+the leading dimensions; unsupported activation dtypes and shapes use the
+portable path.
+The backend is experimental and disabled unless
+`COMFYUI_GGUF_KQUANT_BACKEND=bundled` is set. With the variable unset (or set
+to `none`), the existing PyTorch dequantization path stays active. Current
+shape-aware tile configs are restricted to a small set of measured LTX Q5_K
+and Q6_K Linear shapes on an RTX 3080 Laptop; all other shapes, dtypes, and
+activation sizes use the reference path. This does not establish performance
+or correctness on the reporter's RTX 5090. Non-Linear operations, unsupported
+block alignment, active weight patches/LoRAs, and backend failures also use
+the reference path. `Q2_K`, `Q3_K`, `Q8_K`, IQ formats, and custom CR formats
+are intentionally outside this route.
 
 ### K-Quant Creation
 

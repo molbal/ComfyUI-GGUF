@@ -27,6 +27,63 @@ def _supports(*, qtype, device, input_dtype, weight_shape, weight_dtype):
     )
 
 
+def _select_launch_config(*, qtype, input_dtype, input_shape, weight_shape, device):
+    if (
+        device.type != "cuda"
+        or input_dtype not in {torch.float16, torch.bfloat16}
+        or len(input_shape) < 2
+        or len(weight_shape) != 2
+    ):
+        return None
+
+    m_size = 1
+    for dim in input_shape[:-1]:
+        m_size *= dim
+
+    n_size, k_size = weight_shape
+    if qtype == "Q5_K" and (n_size, k_size) == (16384, 4096):
+        if m_size <= 64:
+            block_m = 64
+        elif m_size <= 128:
+            block_m = 128
+        elif m_size <= 256:
+            block_m = 256
+        else:
+            return None
+    elif qtype == "Q5_K" and (n_size, k_size) == (4096, 4096):
+        if m_size <= 64:
+            block_m = 64
+        elif m_size <= 128:
+            block_m = 128
+        elif m_size <= 256:
+            block_m = 256
+        else:
+            return None
+    elif qtype == "Q6_K" and (n_size, k_size) == (4096, 16384):
+        if m_size <= 64:
+            block_m = 64
+        elif m_size <= 128:
+            block_m = 128
+        elif m_size <= 512:
+            block_m = 256
+        else:
+            return None
+    else:
+        return None
+
+    return block_m, 32, 32
+
+
+def _should_use(*, qtype, device, input_dtype, input_shape, weight_shape, weight_dtype):
+    return _select_launch_config(
+        qtype=qtype,
+        device=device,
+        input_dtype=input_dtype,
+        input_shape=input_shape,
+        weight_shape=weight_shape,
+    ) is not None
+
+
 if triton is not None:
 
     @triton.jit
@@ -106,7 +163,12 @@ if triton is not None:
                         min_low & 0x3F,
                         (scale_high >> 4) | ((min_low >> 2) & 0x30),
                     )
-                    w = d[:, None] * scale.to(tl.float32) * q.to(tl.float32) - dmin[:, None] * minimum.to(tl.float32)
+                    d_compute = d[:, None].to(x.dtype).to(tl.float32)
+                    dmin_compute = dmin[:, None].to(x.dtype).to(tl.float32)
+                    scaled = (d_compute * scale.to(tl.float32)).to(x.dtype).to(tl.float32)
+                    min_scaled = (dmin_compute * minimum.to(tl.float32)).to(x.dtype).to(tl.float32)
+                    product = (scaled * q.to(tl.float32)).to(x.dtype).to(tl.float32)
+                    w = product - min_scaled
                 else:
                     group16 = local // 16
                     group32 = local // 32
@@ -124,7 +186,9 @@ if triton is not None:
                         mask=valid_n[:, None],
                         other=0,
                     ).to(tl.int8).to(tl.float32)
-                    w = d[:, None] * scale * (q.to(tl.float32) - 32.0)
+                    d_compute = d[:, None].to(x.dtype).to(tl.float32)
+                    scaled = (d_compute * scale).to(x.dtype).to(tl.float32)
+                    w = (scaled * (q.to(tl.float32) - 32.0)).to(x.dtype).to(tl.float32)
     
                 acc += tl.dot(x, tl.trans(w).to(x.dtype), input_precision="ieee")
 
@@ -149,13 +213,21 @@ def linear(*, input, weight, qtype, weight_shape, bias=None):
         raise ValueError("K-quant Linear requires at least a 2-D activation")
 
     original_shape = input.shape
-    x = input.reshape(-1, original_shape[-1]).contiguous()
     n_size, k_size = weight_shape
+    config = _select_launch_config(
+        qtype=qtype,
+        input_dtype=input.dtype,
+        input_shape=tuple(input.shape),
+        weight_shape=weight_shape,
+        device=input.device,
+    )
+    if config is None:
+        raise RuntimeError("Triton K-quant backend has no tuned config for this route")
+    block_m, block_n, block_k = config
+
+    x = input.reshape(-1, original_shape[-1]).contiguous()
     output = torch.empty((x.shape[0], n_size), device=x.device, dtype=x.dtype)
     qtype_code = {"Q4_K": 0, "Q5_K": 1, "Q6_K": 2}[qtype]
-    block_n = 32
-    block_m = 16
-    block_k = 32
     grid = (triton.cdiv(x.shape[0], block_m), triton.cdiv(n_size, block_n))
     _kquant_linear_kernel[grid](
         x,
@@ -185,12 +257,14 @@ def linear(*, input, weight, qtype, weight_shape, bias=None):
             else triton.language.float32
         ),
         num_warps=4,
+        num_stages=1,
     )
     return output.reshape(*original_shape[:-1], n_size)
 
 
 class _Backend:
     supports = staticmethod(_supports)
+    should_use = staticmethod(_should_use)
     linear = staticmethod(linear)
 
 
