@@ -85,8 +85,11 @@ could not hide or create output differences.
 | ComfyUI prompt execution median | 103.29 s | 98.30 s |
 | Instrumented sampling/upscale/video-decode pipeline median | 48.93 s | 42.34 s |
 
-This is a measured 4.8% prompt-latency reduction in this reduced, cached-prompt
-workflow, with only two measured runs per route. It is not a full-resolution
+This is a measured 4.8% prompt-latency reduction in this reduced, default-cache
+workflow, with only two measured runs per route. These are not verified
+cached-prompt timings: a later comparison found that ComfyUI's default
+RAM-pressure cache can evict nodes and repeat text encoding and model loading.
+It is not a full-resolution
 or RTX 5090 result and does not resolve the separate city96-relative
 text-encoder regression. The backend remains disabled by default. Nineteen
 focused backend tests passed, including actual static and Dynamic VRAM
@@ -94,6 +97,38 @@ operations, and CUDA memcheck found no errors in the new decoder tests.
 An isolated decoder racecheck also reported zero hazards while Q4_K, Q5_K,
 and Q6_K results matched CPU references across FP16/BF16/FP32 decode precision
 and FP16/BF16 output precision.
+
+A direct comparison then used city96 `6ea2651` (the reporter's revision and
+upstream HEAD at measurement time), fork `e5e7ce3` with the backend disabled,
+and the same fork with `bundled` enabled. The models, local ComfyUI
+installation, KJ loader settings, reduced graph, seed, and input were
+unchanged. An initial default-cache sweep confirmed bit-identical outputs,
+but unequal cached-node sets made its timing comparison unsuitable for
+isolating the execution paths.
+
+The controlled repeat used `--cache-classic` for all three implementations
+and verified the same 23 cached nodes in every measured execution, including
+text encoding and model loading. Six isolated processes ran in the order
+city96 / fork-portable / candidate / candidate / fork-portable / city96,
+with one warmup and two measured runs per process: four measured runs per
+implementation. Cold loads and warmups are excluded from the following table.
+Audio decoding and video encoding remain excluded.
+
+| Cached reduced-workflow timing | city96 `6ea2651` | Fork portable `e5e7ce3` | Candidate `e5e7ce3` |
+| --- | ---: | ---: | ---: |
+| ComfyUI prompt median | 46.47 s | 43.29 s | 41.48 s |
+| Prompt range across four measured runs | 46.20-46.82 s | 42.02-45.28 s | 38.95-43.01 s |
+| Sampling/upscale/video-decode pipeline median | 46.31 s | 43.13 s | 41.30 s |
+
+The candidate's prompt median was 10.7% lower than city96 and 4.2% lower
+than this fork's portable path in this cache-controlled reduced workflow.
+Both sampled video latents and every decoded frame element were bit-identical
+to city96 across all 18 executions, including warmups and repeat controls.
+All tensors were finite. Candidate runs served 832 backend calls each,
+without a failure fallback. The portable/candidate timing ranges overlap,
+so this remains a small-sample local result rather than a universal speed
+claim. It does not establish RTX 5090 performance, full-resolution LTX
+performance, or text-encoder performance; text encoding was cached.
 
 `_K` remains reasonable for text encoders when the compressed file or
 CPU/offload footprint is the primary constraint and the one-time text encoding
