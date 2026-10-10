@@ -33,6 +33,31 @@ if "input_act_weight" not in _int8_linear_params:
     comfy.quant_ops.ck.int8_linear = _compat_int8_linear
 
 
+# ComfyUI forwards activation-quantization kwargs (input_act, act_weight,
+# residual, ...) through forward_comfy_cast_weights on every Linear call.
+# The GGML path dequantizes weights eagerly and never uses them, so filter
+# them out against each forward_ggml_cast_weights signature. This keeps
+# GGUF usable across the supported core versions without touching the
+# individual implementations.
+_ggml_kwarg_names = {}
+
+def _filter_ggml_kwargs(func, kwargs):
+    if not kwargs:
+        return kwargs
+    fn = getattr(func, "__func__", func)
+    names = _ggml_kwarg_names.get(fn)
+    if names is None:
+        params = inspect.signature(fn).parameters
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return kwargs
+        names = frozenset(
+            name for name, p in params.items()
+            if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
+        _ggml_kwarg_names[fn] = names
+    return {name: value for name, value in kwargs.items() if name in names}
+
+
 _PERF_LOG_ENV = "COMFYUI_GGUF_PERF_LOG"
 _INT4_LORA_OFFLOAD_ENV = "COMFYUI_GGUF_INT4_LORA_OFFLOAD"
 
@@ -479,7 +504,9 @@ class GGMLLayer(torch.nn.Module):
 
     def forward_comfy_cast_weights(self, input, *args, **kwargs):
         if self.is_ggml_quantized():
-            out = self.forward_ggml_cast_weights(input, *args, **kwargs)
+            out = self.forward_ggml_cast_weights(
+                input, *args, **_filter_ggml_kwargs(self.forward_ggml_cast_weights, kwargs)
+            )
         else:
             out = super().forward_comfy_cast_weights(input, *args, **kwargs)
 
