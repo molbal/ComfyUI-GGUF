@@ -708,7 +708,30 @@ def strip_quant_suffix(name):
         name = name[:match.start()]
     return name
 
-def gguf_mmproj_loader(path):
+def _materialize_vision_tensor(value, dtype):
+    """Dequantize vision merge inputs regardless of static/dynamic layout.
+
+    Static loads use GGMLTensor (handled by dequantize_tensor); dynamic loads
+    use comfy_kitchen QuantizedTensor (GGMLLayout) which exposes .dequantize().
+    Merge ops (patch-embed stacking, split QKV concat) require dense tensors.
+    """
+    if hasattr(value, "dequantize") and hasattr(value, "_params"):
+        materialized = value.dequantize()
+        return materialized.to(dtype) if dtype is not None else materialized
+    if is_quantized(value):
+        return dequantize_tensor(value, dtype=dtype)
+    if torch.is_tensor(value):
+        return value.to(dtype) if dtype is not None else value
+    return value
+
+
+def _vision_merge_dtype(value):
+    if hasattr(value, "_params"):
+        return torch.bfloat16
+    return torch.bfloat16 if is_quantized(value) else torch.float16
+
+
+def gguf_mmproj_loader(path, dynamic=False):
     # Reverse version of Qwen2VLVisionModel.modify_tensors
     logging.info("Attenpting to find mmproj file for text encoder...")
 
@@ -743,12 +766,12 @@ def gguf_mmproj_loader(path):
 
     logging.info(f"Using mmproj '{target[0]}' for text encoder '{tenc_fname}'.")
     target = os.path.join(root, target[0])
-    vsd, _ = gguf_sd_loader(target, is_text_model=True)
+    vsd, _ = gguf_sd_loader(target, is_text_model=True, dynamic=dynamic)
 
     # concat 4D to 5D
     if "v.patch_embd.weight.1" in vsd:
-        w1 = dequantize_tensor(vsd.pop("v.patch_embd.weight"), dtype=torch.float32)
-        w2 = dequantize_tensor(vsd.pop("v.patch_embd.weight.1"), dtype=torch.float32)
+        w1 = _materialize_vision_tensor(vsd.pop("v.patch_embd.weight"), torch.float32)
+        w2 = _materialize_vision_tensor(vsd.pop("v.patch_embd.weight.1"), torch.float32)
         vsd["v.patch_embd.weight"] = torch.stack([w1, w2], dim=2)
 
     if any("deepstack" in key or "deepstast" in key or "attn_qkv" in key for key in vsd):
@@ -770,9 +793,7 @@ def gguf_mmproj_loader(path):
                 k_attn += ".attn.qkv." + k_name.split(".")[-1]
                 if k_attn not in attns:
                     attns[k_attn] = {}
-                attns[k_attn][k_name] = dequantize_tensor(
-                    v, dtype=(torch.bfloat16 if is_quantized(v) else torch.float16)
-                )
+                attns[k_attn][k_name] = _materialize_vision_tensor(v, _vision_merge_dtype(v))
 
         # recombine
         for k,v in attns.items():
@@ -1062,17 +1083,17 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None, return_extra=F
         elif arch == "qwen35":
             sd = sd_map_replace(sd, QWEN35_SD_MAP)
             sd = qwen35_corrections(sd)
-            vsd = gguf_mmproj_loader(path)
+            vsd = gguf_mmproj_loader(path, dynamic=dynamic)
             sd.update(vsd)
         else:
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch == "llama":
             sd = llama_permute(sd, 32, 8) # L3 / Mistral
         if arch == "qwen2vl":
-            vsd = gguf_mmproj_loader(path)
+            vsd = gguf_mmproj_loader(path, dynamic=dynamic)
             sd.update(vsd)
         if arch == "qwen3vl":
-            vsd = {} if qwen3vl_text_only else gguf_mmproj_loader(path)
+            vsd = {} if qwen3vl_text_only else gguf_mmproj_loader(path, dynamic=dynamic)
             if vsd and "model.layers.49.self_attn.q_proj.weight" in sd:
                 # MiniMax H3 receives the Qwen3-VL vision tower under
                 # ``visual.*``, unlike the standalone Qwen3-VL variants.

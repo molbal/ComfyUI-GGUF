@@ -2124,7 +2124,9 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
             ) as sd_loader:
                 mapped = self.loader.gguf_mmproj_loader(str(text_encoder))
 
-        sd_loader.assert_called_once_with(str(matching_mmproj), is_text_model=True)
+        sd_loader.assert_called_once_with(
+            str(matching_mmproj), is_text_model=True, dynamic=False
+        )
         self.assertIn("model.visual.deepstack_merger_list.0.norm.weight", mapped)
 
     def test_qwen3vl_mmproj_lookup_rejects_ambiguous_alias_matches(self):
@@ -2139,6 +2141,113 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
                     self.loader.gguf_mmproj_loader(str(text_encoder))
 
         sd_loader.assert_not_called()
+
+
+class MmprojDynamicForwardingTests(unittest.TestCase):
+    """Regression coverage for issue #31: dynamic CLIP loads must forward
+    the dynamic flag to the mmproj vision file. Otherwise the LM stages as
+    QuantizedTensor while vision stages as legacy GGMLTensor, and image-edit
+    gathers visual attn.qkv ([3456, 1152]-family) as dense fp16."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.loader = load_gguf_loader()
+
+    def _encoder_with_mmproj(self, temp_dir):
+        text_encoder = Path(temp_dir) / "Qwen3-VL-8B-Instruct-Q8_0.gguf"
+        mmproj = Path(temp_dir) / "Qwen3-VL-8B-Instruct-mmproj-F16.gguf"
+        text_encoder.touch()
+        mmproj.touch()
+        return text_encoder, mmproj
+
+    def test_clip_loader_forwards_dynamic_to_mmproj(self):
+        for dynamic in (False, True):
+            with self.subTest(dynamic=dynamic):
+                with TemporaryDirectory() as temp_dir:
+                    text_encoder, mmproj = self._encoder_with_mmproj(temp_dir)
+                    calls = []
+
+                    def fake_sd_loader(path, is_text_model=False, dynamic=False,
+                                       progress_callback=None):
+                        calls.append((str(path), dynamic))
+                        if str(path) == str(mmproj):
+                            return (
+                                {
+                                    "v.blk.0.attn_qkv.weight": torch.ones(12, 4),
+                                    "v.deepstack.0.norm.weight": torch.ones(8),
+                                },
+                                {},
+                            )
+                        return (
+                            {
+                                "model.layers.0.input_layernorm.weight": torch.zeros(2560),
+                            },
+                            {"arch_str": "qwen3vl", "metadata": {}},
+                        )
+
+                    with mock.patch.object(
+                        self.loader, "gguf_sd_loader", side_effect=fake_sd_loader
+                    ):
+                        state_dict = self.loader.gguf_clip_loader(
+                            str(text_encoder), dynamic=dynamic
+                        )
+
+                    mmproj_calls = [call for call in calls if call[0] == str(mmproj)]
+                    self.assertEqual(len(mmproj_calls), 1)
+                    self.assertEqual(mmproj_calls[0][1], dynamic)
+                    self.assertIn("model.visual.blocks.0.attn.qkv.weight", state_dict)
+
+    def test_materialize_vision_tensor_handles_dynamic_quantized(self):
+        class FakeQuantized:
+            def __init__(self):
+                self._params = SimpleNamespace(tensor_type="Q8_0")
+
+            def dequantize(self):
+                return torch.ones(2, 2)
+
+        materialized = self.loader._materialize_vision_tensor(
+            FakeQuantized(), torch.float16
+        )
+        self.assertTrue(torch.is_tensor(materialized))
+        self.assertEqual(materialized.dtype, torch.float16)
+        self.assertTrue(torch.equal(materialized, torch.ones(2, 2, dtype=torch.float16)))
+
+        dense = torch.ones(2, 2)
+        self.assertTrue(
+            torch.equal(self.loader._materialize_vision_tensor(dense, None), dense)
+        )
+
+    def test_mmproj_dynamic_split_qkv_materializes_quantized_inputs(self):
+        class FakeQuantized:
+            def __init__(self, value):
+                self._params = SimpleNamespace(tensor_type="Q8_0")
+                self._value = value
+
+            def dequantize(self):
+                return self._value
+
+        with TemporaryDirectory() as temp_dir:
+            text_encoder, _ = self._encoder_with_mmproj(temp_dir)
+            split = {
+                "v.blk.0.attn_q.weight": FakeQuantized(torch.ones(4, 4)),
+                "v.blk.0.attn_k.weight": FakeQuantized(torch.full((4, 4), 2.0)),
+                "v.blk.0.attn_v.weight": FakeQuantized(torch.full((4, 4), 3.0)),
+                "v.blk.0.attn_q.bias": FakeQuantized(torch.zeros(4)),
+                "v.blk.0.attn_k.bias": FakeQuantized(torch.zeros(4)),
+                "v.blk.0.attn_v.bias": FakeQuantized(torch.zeros(4)),
+            }
+            with mock.patch.object(
+                self.loader, "gguf_sd_loader", return_value=(split, {})
+            ):
+                mapped = self.loader.gguf_mmproj_loader(
+                    str(text_encoder), dynamic=True
+                )
+
+        fused = mapped["visual.blocks.0.attn.qkv.weight"]
+        self.assertEqual(fused.shape, (12, 4))
+        self.assertTrue(torch.equal(fused[:4], torch.ones(4, 4)))
+        self.assertTrue(torch.equal(fused[4:8], torch.full((4, 4), 2.0)))
+        self.assertTrue(torch.equal(fused[8:], torch.full((4, 4), 3.0)))
 
 
 class Qwen35GGUFLoaderTests(unittest.TestCase):
