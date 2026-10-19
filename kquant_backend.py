@@ -191,11 +191,9 @@ def try_kquant_linear(input_tensor, qdata, qtype, weight_shape, bias=None, *, de
     if qdata.device != input_tensor.device or not _valid_storage(qdata, qtype, weight_shape):
         return None
 
-    out_features, in_features = weight_shape
-    _, type_size = gguf.GGML_QUANT_SIZES[qtype]
-    row_bytes = (in_features // 256) * type_size
-    qdata = qdata.reshape((out_features, row_bytes)).contiguous()
-
+    # Gate on backend availability before paying for any repacking: the
+    # reshape/contiguous below copies whole weight storages, so it must not
+    # run on routes that fall back to portable dequantization anyway.
     backend = _load_backend()
     if backend is None:
         return None
@@ -225,10 +223,14 @@ def try_kquant_linear(input_tensor, qdata, qtype, weight_shape, bias=None, *, de
             dequant_dtype=decode_dtype,
         ):
             return None
+        out_features, in_features = weight_shape
+        _, type_size = gguf.GGML_QUANT_SIZES[qtype]
+        row_bytes = (in_features // 256) * type_size
+        packed = qdata.reshape((out_features, row_bytes)).contiguous()
         precision_kwargs = {"dequant_dtype": decode_dtype} if precision_aware else {}
         output = backend.linear(
             input=input_tensor,
-            weight=qdata.contiguous(),
+            weight=packed,
             qtype=qtype.name,
             weight_shape=weight_shape,
             bias=bias,

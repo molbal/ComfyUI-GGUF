@@ -115,3 +115,17 @@ Q5_K/Q6_K remain limited to measured LTX matrix shapes and at most 1024 rows.
 Set `COMFYUI_GGUF_KQUANT_BACKEND=none` before starting ComfyUI to opt out.
 
 See [K-quant inference notes](docs/k-quant-inference.md) for details.
+
+## Loader choice and residency
+
+Prefer the **Dynamic VRAM** loader nodes when your ComfyUI build supports
+Dynamic VRAM: they avoid per-forward dequantization overhead on large text
+encoders and retain native INT8 paths where available.
+
+Fixed in this fork ([issue #26](https://github.com/molbal/ComfyUI-GGUF/issues/26)):
+the legacy loaders forced a full model unload+reload cycle on every
+`load_models_gpu` call (including each text encode), making a 12B text
+encoder ~4x slower than upstream on identical hardware. Patch forcing is now
+limited to loads where adapter reinstallation is actually required, so a
+resident model with unchanged patches takes ComfyUI's no-movement fast path.
+Quantized weight VRAM accounting additionally reports packed storage bytes.

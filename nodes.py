@@ -37,6 +37,7 @@ from .loader import (
     gguf_tensor_count,
 )
 from .dequant import dequantize_tensor, is_quantized, is_torch_compatible
+from .patch_state import requires_patch_reinstall
 from .tools.convert import (
     DEFAULT_TARGET_SIZE_Q8_TYPE,
     QUANT_TYPE_MAP,
@@ -188,6 +189,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 out_weight = weight.to(device_to)
                 patches = move_patch_to_device(patches, self.load_device if self.patch_on_device else self.offload_device)
                 install_patch(patches, key)
+                self._gguf_patches_installed = True
                 logging.warning(f"Custom ConvRot quantized GGUF is best used with the f{UnetLoaderGGUFDynamicVRAM.TITLE} loader node, because using it with Legacy VRAM is much slower.")
                 if inplace_update:
                     comfy.utils.copy_to_param(self.model, key, out_weight)
@@ -203,6 +205,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 install_patch(patches, key)
             # TODO: do we ever have legitimate duplicate patches? (i.e. patch on top of patched weight)
             out_weight.patches = [(patches, key)]
+            self._gguf_patches_installed = True
         else:
             inplace_update = self.weight_inplace_update or inplace_update
             if key not in self.backup:
@@ -227,6 +230,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         if unpatch_weights:
             self._evict_gguf_quantized_caches()
             self._gguf_patch_layout_signature = None
+            self._gguf_patches_installed = False
             for module in self.model.modules():
                 if getattr(module, "_gguf_static_patch", False):
                     module.weight_function = []
@@ -254,7 +258,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     named_modules_to_munmap = {}
 
     def partially_unload(self, *args, force_patch_weights=False, **kwargs):
-        result = super().partially_unload(*args, force_patch_weights=True, **kwargs)
+        result = super().partially_unload(*args, force_patch_weights=force_patch_weights or requires_patch_reinstall(self), **kwargs)
         if args:
             self._move_gguf_quantized_caches(args[0])
         elif "device_to" in kwargs:
@@ -262,14 +266,18 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         return result
 
     def partially_load(self, *args, force_patch_weights=False, **kwargs):
-        return super().partially_load(*args, force_patch_weights=True, **kwargs)
+        return super().partially_load(*args, force_patch_weights=force_patch_weights or requires_patch_reinstall(self), **kwargs)
 
     def load(self, *args, force_patch_weights=False, **kwargs):
         if not self.mmap_released:
             self.named_modules_to_munmap = dict(self.model.named_modules())
 
-        # always call `patch_weight_to_device` even for lowvram
-        super().load(*args, force_patch_weights=True, **kwargs)
+        # Route GGUF quantized patches through patch_weight_to_device (the
+        # default low-VRAM path would bind them to weight_function lists the
+        # GGML forward path ignores), but only when reinstallation is
+        # actually required: forcing unconditionally makes every
+        # load_models_gpu call pay a full unload+reload cycle (issue #26).
+        super().load(*args, force_patch_weights=force_patch_weights or requires_patch_reinstall(self), **kwargs)
         self._prepare_gguf_quantized_weights()
 
         # make sure nothing stays linked to mmap after first load
@@ -305,6 +313,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         n.patch_on_device = getattr(self, "patch_on_device", False)
         n.mmap_released = getattr(self, "mmap_released", False)
         n._gguf_patch_layout_signature = getattr(self, "_gguf_patch_layout_signature", None)
+        n._gguf_patches_installed = getattr(self, "_gguf_patches_installed", False)
         if src_cls != GGUFModelPatcher:
             n.size = 0 # force recalc
         return n

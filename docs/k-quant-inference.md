@@ -237,7 +237,9 @@ rejected kernel calls also fall back to the existing dequantized operation.
 
 The bundled backend module is loaded by default when
 `COMFYUI_GGUF_KQUANT_BACKEND` is unset or empty; its Triton kernels run only
-on supported routes, with all other cases using portable dequantization. To
+on supported routes, with all other cases using portable dequantization. The
+dispatcher checks backend availability before repacking any weight storage,
+so declined and disabled routes perform no per-forward copies. To
 opt out entirely, set the variable before starting ComfyUI; in PowerShell:
 
 ```powershell
@@ -311,6 +313,35 @@ size, ComfyUI offload policy, and whether the model is compute- or
 transfer-bound. There is no defensible universal tokens/s or seconds/step
 multiplier without a benchmark on the target workflow.
 
+## Issue #26 status
+
+Measurement on one RTX 3090 / ComfyUI 0.41 box reproduced the legacy text
+encoder gap on identical hardware and revision: city96 `6ea2651` encodes in
+3.05 s (warm median of 7) while the fork took 12.3–12.6 s (4.1x). Profiler
+comparison showed identical matmul/dequant kernels and call counts; the fork
+alone spent ~12.6 s in device↔host copies per encode.
+
+Root cause: `GGUFModelPatcher` unconditionally forced `force_patch_weights`
+on every `partially_load`/`load`, so each `load_models_gpu` call (ComfyUI
+invokes it on every text encode) took a full model unload+reload cycle. The
+flag exists so GGUF quantized patches route through `patch_weight_to_device`
+(the default low-VRAM adapter path is ignored by the GGML forward), but it is
+only needed when reinstallation is required. Forcing is now limited to loads
+with quantized-touching patches that are not currently installed
+(`patch_state.requires_patch_reinstall`, covered by
+`tests/test_patch_state.py`); resident models with unchanged patches take
+ComfyUI's no-movement fast path. The fake VRAM-accounting state dict
+additionally reports packed storage bytes (`ggml_packed_nbytes()` in
+`dequant.py`, covered by `tests/test_gguf_state_size.py`), and the K-quant
+dispatcher gates on backend availability before repacking weight storage
+(`tests/test_kquant_probe_order.py`).
+
+Still open, pending reporter hardware: RTX 5090 (SM 12.0) has no accelerated
+K-quant route and uses the portable path; and one t2v comparison showed the
+portable path ~39.5 dB from city96 while the gated kernel matched exactly,
+which needs a controlled `--cache-classic` retest after this fix since
+placement alone cannot change numerics.
+
 ## Recommended Choices
 
 - **Diffusion models on NVIDIA:** Prefer `Q8_CR` for eligible transformer/DiT
@@ -322,6 +353,10 @@ multiplier without a benchmark on the target workflow.
 - **Text encoders under memory pressure:** `_K` can be useful if its measured
   prompt-encoding latency is acceptable. `Q4_K_M`/`Q5_K_M` are quality/storage
   candidates, not speed recommendations.
+- **Loader nodes:** Prefer the Dynamic VRAM loaders when the ComfyUI build
+  supports them. The legacy loaders dequantize packed weights on every
+  forward; on large text encoders this is several times slower
+  ([issue #26](https://github.com/molbal/ComfyUI-GGUF/issues/26)).
 
 ## Benchmark Protocol
 

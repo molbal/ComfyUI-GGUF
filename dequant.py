@@ -20,6 +20,27 @@ def is_torch_compatible(tensor):
 def is_quantized(tensor):
     return not is_torch_compatible(tensor)
 
+def ggml_packed_nbytes(tensor_type, tensor_shape):
+    """Packed storage bytes for a GGML tensor shape, or None when unknown.
+
+    Quantized weights stay packed in VRAM, so ComfyUI VRAM accounting must
+    use this size rather than dequantized-shape x compute-dtype.
+    """
+    if tensor_type is None:
+        return None
+    quant_sizes = gguf.GGML_QUANT_SIZES.get(tensor_type)
+    if not quant_sizes:
+        return None
+    block_size, type_size = quant_sizes
+    if not block_size or not type_size:
+        return None
+    numel = 1
+    for dim in tensor_shape:
+        numel *= int(dim)
+    if numel <= 0 or numel % block_size:
+        return None
+    return (numel // block_size) * type_size
+
 def dequantize_tensor(tensor, dtype=None, dequant_dtype=None):
     qtype = getattr(tensor, "tensor_type", None)
     oshape = getattr(tensor, "tensor_shape", tensor.shape)
