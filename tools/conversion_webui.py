@@ -1,7 +1,12 @@
 """Local web dashboard for tools/convert.py.
 
-Run from the repository root with:
+Run from the repository root with the ComfyUI Python environment:
     python tools\\conversion_webui.py
+
+A pythonXX._pth file next to the interpreter (the ComfyUI Windows portable pack
+ships python313._pth) starts CPython in isolated safe-path mode, so the script
+directory is not added to sys.path and PYTHONPATH is ignored; the setup below
+registers tools/ explicitly instead.
 """
 
 from __future__ import annotations
@@ -23,10 +28,19 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    # Interpreters that ship a pythonXX._pth file next to the executable (the
+    # ComfyUI Windows portable pack) start in isolated safe-path mode: sys.path
+    # comes from that file, the script's own folder is never prepended, and
+    # PYTHONPATH is ignored, so the plain "import convert" fallback below would
+    # fail with ModuleNotFoundError. Register tools/ explicitly instead.
+    sys.path.insert(0, str(TOOLS_DIR))
+
 try:
     from .convert import QUANT_TYPE_MAP
 except ImportError:
-    from convert import QUANT_TYPE_MAP
+    from convert import QUANT_TYPE_MAP  # noqa: E402  (tools/convert.py)
 
 
 ROOT = Path(__file__).resolve().parent.parent
