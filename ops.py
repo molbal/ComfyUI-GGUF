@@ -13,7 +13,7 @@ import comfy.ops
 import comfy.lora
 import comfy.model_management
 import comfy.quant_ops
-from .dequant import dequantize_tensor, is_quantized
+from .dequant import dequantize_tensor, ggml_packed_nbytes, is_quantized
 from .kquant_backend import SUPPORTED_K_QUANTS, try_kquant_linear
 
 
@@ -434,12 +434,13 @@ class GGMLLayer(torch.nn.Module):
         return super()._save_to_state_dict(*args, **kwargs)
 
     def ggml_save_to_state_dict(self, destination, prefix, keep_vars):
-        # This is a fake state dict for vram estimation
-        weight = torch.zeros_like(self.weight, device=torch.device("meta"))
-        destination[prefix + "weight"] = weight
+        # This is a fake state dict for vram estimation. Quantized weights
+        # stay packed in VRAM, so report packed storage bytes. Sizing by
+        # dequantized shape x compute dtype over-reports ~2x and pushes
+        # large models into offload streaming (see issue #26).
+        destination[prefix + "weight"] = _ggml_fake_state_tensor(self.weight)
         if self.bias is not None:
-            bias = torch.zeros_like(self.bias, device=torch.device("meta"))
-            destination[prefix + "bias"] = bias
+            destination[prefix + "bias"] = _ggml_fake_state_tensor(self.bias)
 
         # Take into account space required for dequantizing the largest tensor
         if self.largest_layer:
@@ -602,6 +603,16 @@ class GGMLOps(comfy.ops.manual_cast):
         def forward_ggml_cast_weights(self, input):
             weight, bias = self.cast_bias_weight(input)
             return torch.nn.functional.group_norm(input, self.num_groups, weight, bias, self.eps)
+
+def _ggml_fake_state_tensor(tensor):
+    if is_quantized(tensor):
+        packed = ggml_packed_nbytes(
+            getattr(tensor, "tensor_type", None),
+            getattr(tensor, "tensor_shape", tensor.shape),
+        )
+        if packed is not None:
+            return torch.empty(packed, dtype=torch.uint8, device=torch.device("meta"))
+    return torch.zeros_like(tensor, device=torch.device("meta"))
 
 def move_patch_to_device(item, device):
     if isinstance(item, torch.Tensor):

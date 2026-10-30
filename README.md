@@ -122,3 +122,9 @@ Q5_K/Q6_K remain limited to measured LTX matrix shapes and at most 1024 rows.
 Set `COMFYUI_GGUF_KQUANT_BACKEND=none` before starting ComfyUI to opt out.
 
 See [K-quant inference notes](docs/k-quant-inference.md) for details.
+
+## Legavy vs Dynamic VRAM
+
+Prefer the **Dynamic VRAM** loader nodes when your ComfyUI build supports
+Dynamic VRAM: they avoid per-forward dequantization overhead on large text
+encoders and retain native INT8 paths where available.
