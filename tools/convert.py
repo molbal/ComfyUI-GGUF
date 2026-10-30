@@ -41,38 +41,90 @@ QWEN3VL_SOURCE_PREFIX = "model.language_model."
 QWEN3VL_VISUAL_PREFIX = "model.visual."
 QWEN3VL_TEXT_ONLY_METADATA = "comfy.gguf.qwen3vl.text_only"
 QWEN3VL_VARIANT_METADATA = "comfy.gguf.qwen3vl.variant"
+QWEN3VL_LANGUAGE_LAYERS = 36
 QWEN3VL_SOURCE_LANGUAGE_TENSOR_COUNT = 398
 QWEN3VL_SOURCE_VISUAL_TENSOR_COUNT = 315
 QWEN3VL_SOURCE_TENSOR_COUNT = 713
-QWEN3VL_LANGUAGE_SHAPES = {
-    f"{QWEN3VL_SOURCE_PREFIX}embed_tokens.weight": (151936, 2560),
-    f"{QWEN3VL_SOURCE_PREFIX}norm.weight": (2560,),
-}
-for _layer_index in range(36):
-    for _suffix, _shape in {
-        "input_layernorm.weight": (2560,),
-        "post_attention_layernorm.weight": (2560,),
-        "self_attn.k_norm.weight": (128,),
-        "self_attn.q_norm.weight": (128,),
-        "self_attn.k_proj.weight": (1024, 2560),
-        "self_attn.q_proj.weight": (4096, 2560),
-        "self_attn.v_proj.weight": (1024, 2560),
-        "self_attn.o_proj.weight": (2560, 4096),
-        "mlp.down_proj.weight": (2560, 9728),
-        "mlp.gate_proj.weight": (9728, 2560),
-        "mlp.up_proj.weight": (9728, 2560),
-    }.items():
-        QWEN3VL_LANGUAGE_SHAPES[
-            f"{QWEN3VL_SOURCE_PREFIX}layers.{_layer_index}.{_suffix}"
-        ] = _shape
-QWEN3VL_VISUAL_SIGNATURE_SHAPES = {
-    f"{QWEN3VL_VISUAL_PREFIX}patch_embed.proj.weight": (1024, 3, 2, 16, 16),
-    f"{QWEN3VL_VISUAL_PREFIX}pos_embed.weight": (2304, 1024),
-    f"{QWEN3VL_VISUAL_PREFIX}blocks.0.attn.qkv.weight": (3072, 1024),
-    f"{QWEN3VL_VISUAL_PREFIX}merger.linear_fc2.weight": (2560, 4096),
-    f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.0.norm.weight": (4096,),
-    f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.2.linear_fc2.weight": (2560, 4096),
-}
+QWEN3VL_8B_SOURCE_LANGUAGE_TENSOR_COUNT = 398
+QWEN3VL_8B_SOURCE_VISUAL_TENSOR_COUNT = 351
+QWEN3VL_8B_SOURCE_TENSOR_COUNT = 749
+
+
+def _qwen3vl_language_shapes(hidden_size, q_proj_size, kv_proj_size, mlp_size, vocab_size=151936):
+    """Language key/shape table; the key set is shared by every Qwen3-VL size."""
+    shapes = {
+        f"{QWEN3VL_SOURCE_PREFIX}embed_tokens.weight": (vocab_size, hidden_size),
+        f"{QWEN3VL_SOURCE_PREFIX}norm.weight": (hidden_size,),
+    }
+    for _layer_index in range(QWEN3VL_LANGUAGE_LAYERS):
+        for _suffix, _shape in {
+            "input_layernorm.weight": (hidden_size,),
+            "post_attention_layernorm.weight": (hidden_size,),
+            "self_attn.k_norm.weight": (128,),
+            "self_attn.q_norm.weight": (128,),
+            "self_attn.k_proj.weight": (kv_proj_size, hidden_size),
+            "self_attn.q_proj.weight": (q_proj_size, hidden_size),
+            "self_attn.v_proj.weight": (kv_proj_size, hidden_size),
+            "self_attn.o_proj.weight": (hidden_size, q_proj_size),
+            "mlp.down_proj.weight": (hidden_size, mlp_size),
+            "mlp.gate_proj.weight": (mlp_size, hidden_size),
+            "mlp.up_proj.weight": (mlp_size, hidden_size),
+        }.items():
+            shapes[
+                f"{QWEN3VL_SOURCE_PREFIX}layers.{_layer_index}.{_suffix}"
+            ] = _shape
+    return shapes
+
+
+def _qwen3vl_visual_shapes(visual_size, out_hidden_size):
+    """A few visual tensors that pin down which Qwen3-VL size the checkpoint is."""
+    merge_size = visual_size * 4  # spatial_merge_size=2
+    return {
+        f"{QWEN3VL_VISUAL_PREFIX}patch_embed.proj.weight": (visual_size, 3, 2, 16, 16),
+        f"{QWEN3VL_VISUAL_PREFIX}pos_embed.weight": (2304, visual_size),
+        f"{QWEN3VL_VISUAL_PREFIX}blocks.0.attn.qkv.weight": (visual_size * 3, visual_size),
+        f"{QWEN3VL_VISUAL_PREFIX}merger.linear_fc2.weight": (out_hidden_size, merge_size),
+        f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.0.norm.weight": (merge_size,),
+        f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.2.linear_fc2.weight": (out_hidden_size, merge_size),
+    }
+
+
+# Qwen3-VL 4B: language hidden 2560, visual hidden 1024 (24 blocks).
+QWEN3VL_LANGUAGE_SHAPES = _qwen3vl_language_shapes(2560, 4096, 1024, 9728)
+QWEN3VL_VISUAL_SIGNATURE_SHAPES = _qwen3vl_visual_shapes(1024, 2560)
+# Qwen3-VL 8B: same language key set, hidden 4096, visual hidden 1152 (27 blocks).
+QWEN3VL_8B_LANGUAGE_SHAPES = _qwen3vl_language_shapes(4096, 4096, 1024, 12288)
+QWEN3VL_8B_VISUAL_SIGNATURE_SHAPES = _qwen3vl_visual_shapes(1152, 4096)
+
+
+def qwen3vl_variant_specs():
+    """Validation tables per supported Qwen3-VL size.
+
+    Read from module globals at call time so that tests can patch the tables,
+    and so a future size only needs one more entry here.
+    """
+    return (
+        {
+            "variant": "4b",
+            "language_shapes": QWEN3VL_LANGUAGE_SHAPES,
+            "visual_shapes": QWEN3VL_VISUAL_SIGNATURE_SHAPES,
+            "counts": (
+                QWEN3VL_SOURCE_LANGUAGE_TENSOR_COUNT,
+                QWEN3VL_SOURCE_VISUAL_TENSOR_COUNT,
+                QWEN3VL_SOURCE_TENSOR_COUNT,
+            ),
+        },
+        {
+            "variant": "8b",
+            "language_shapes": QWEN3VL_8B_LANGUAGE_SHAPES,
+            "visual_shapes": QWEN3VL_8B_VISUAL_SIGNATURE_SHAPES,
+            "counts": (
+                QWEN3VL_8B_SOURCE_LANGUAGE_TENSOR_COUNT,
+                QWEN3VL_8B_SOURCE_VISUAL_TENSOR_COUNT,
+                QWEN3VL_8B_SOURCE_TENSOR_COUNT,
+            ),
+        },
+    )
 
 
 class SourceStateDict(OrderedDict):
@@ -456,6 +508,8 @@ class ModelMiniMaxMusic3TextEncoder(ModelTemplate):
 
 class ModelQwen3VL(ModelTemplate):
     arch = "qwen3vl"
+    # Set from the detected checkpoint size by detect_arch(); see qwen3vl_variant_specs().
+    qwen3vl_variant = "4b"
     keys_detect = [
         (
             f"{QWEN3VL_SOURCE_PREFIX}layers.0.self_attn.q_proj.weight",
@@ -615,46 +669,59 @@ def map_qwen3_state_dict(state_dict):
 
 
 def normalize_qwen3vl_state_dict(state_dict):
-    """Validate and extract the official BF16 Qwen3-VL 4B language encoder."""
+    """Validate an official BF16 Qwen3-VL checkpoint and extract its language encoder.
+
+    Returns the mapped language-only state dict carrying the detected size
+    variant, or None when the source is not a Qwen3-VL checkpoint at all.
+    """
     keys = set(state_dict)
     if not any(key.startswith(QWEN3VL_SOURCE_PREFIX) for key in keys):
         return None
     embedding_key = f"{QWEN3VL_SOURCE_PREFIX}embed_tokens.weight"
-    layer_35_key = f"{QWEN3VL_SOURCE_PREFIX}layers.35.self_attn.q_proj.weight"
+    layer_35_key = f"{QWEN3VL_SOURCE_PREFIX}layers.{QWEN3VL_LANGUAGE_LAYERS - 1}.self_attn.q_proj.weight"
     if embedding_key not in keys or layer_35_key not in keys:
         raise ValueError(
-            "Only the official Qwen3-VL 4B BF16 checkpoint is supported; "
+            "Only the official Qwen3-VL 4B or 8B BF16 checkpoint is supported; "
             "the language-model key layout is incompatible."
         )
     if not any(key.startswith(QWEN3VL_VISUAL_PREFIX) for key in keys):
         raise ValueError(
-            "Qwen3-VL 4B conversion requires the original checkpoint with both "
+            "Qwen3-VL conversion requires the original checkpoint with both "
             "language and visual tensors; text-only inputs are not a supported source."
         )
 
-    expected_shapes = QWEN3VL_LANGUAGE_SHAPES
+    specs = qwen3vl_variant_specs()
     language_keys = {
         key for key in keys if key.startswith(QWEN3VL_SOURCE_PREFIX)
     }
-    unexpected = sorted(language_keys - expected_shapes.keys())
-    missing = sorted(expected_shapes.keys() - language_keys)
     visual_keys = {key for key in keys if key.startswith(QWEN3VL_VISUAL_PREFIX)}
+    # Every supported Qwen3-VL size shares one language key set, so the key names
+    # are validated once; only shapes and tensor counts are per-size.
     unsupported_prefixes = sorted(
         key for key in keys
         if not key.startswith((QWEN3VL_SOURCE_PREFIX, QWEN3VL_VISUAL_PREFIX))
     )
-    expected_counts = (
-        QWEN3VL_SOURCE_LANGUAGE_TENSOR_COUNT,
-        QWEN3VL_SOURCE_VISUAL_TENSOR_COUNT,
-        QWEN3VL_SOURCE_TENSOR_COUNT,
-    )
     actual_counts = (len(language_keys), len(visual_keys), len(keys))
-    if unexpected or missing or unsupported_prefixes or actual_counts != expected_counts:
+    matches = [spec for spec in specs if spec["counts"] == actual_counts]
+    # Key names are validated against the size the tensor counts selected, and
+    # against the first table when no size matches (the error below reports it).
+    reference = (
+        matches[0]["language_shapes"] if len(matches) == 1
+        else specs[0]["language_shapes"]
+    )
+    unexpected = sorted(language_keys - reference.keys())
+    missing = sorted(reference.keys() - language_keys)
+    if unexpected or missing or unsupported_prefixes or len(matches) != 1:
         details = []
-        if actual_counts != expected_counts:
+        if len(matches) != 1:
+            expected = "; ".join(
+                f"{spec['variant']}=(language, visual, total)={spec['counts']}"
+                for spec in specs
+            )
             details.append(
-                "tensor counts differ from the official 4B layout "
-                f"(language={len(language_keys)}, visual={len(visual_keys)}, total={len(keys)})"
+                "tensor counts differ from the official Qwen3-VL layouts "
+                f"(language={len(language_keys)}, visual={len(visual_keys)}, "
+                f"total={len(keys)}; expected {expected})"
             )
         if missing:
             details.append(f"missing language tensors: {', '.join(missing[:5])}")
@@ -663,9 +730,12 @@ def normalize_qwen3vl_state_dict(state_dict):
         if unsupported_prefixes:
             details.append(f"unsupported tensor names: {', '.join(unsupported_prefixes[:5])}")
         raise ValueError(
-            "Only the official Qwen3-VL 4B BF16 checkpoint layout is supported; "
+            "Only the official Qwen3-VL 4B or 8B BF16 checkpoint layout is supported; "
             + "; ".join(details)
         )
+
+    variant = matches[0]["variant"]
+    expected_shapes = matches[0]["language_shapes"]
 
     non_bf16 = sorted(
         (key, str(value.dtype))
@@ -675,7 +745,7 @@ def normalize_qwen3vl_state_dict(state_dict):
     if non_bf16:
         key, dtype = non_bf16[0]
         raise ValueError(
-            "Qwen3-VL 4B conversion accepts BF16 tensors only; "
+            f"Qwen3-VL {variant} conversion accepts BF16 tensors only; "
             f"{key!r} has dtype {dtype}."
         )
 
@@ -683,14 +753,14 @@ def normalize_qwen3vl_state_dict(state_dict):
         actual_shape = tuple(state_dict[key].shape)
         if actual_shape != expected_shape:
             raise ValueError(
-                f"Unsupported Qwen3-VL 4B tensor shape for {key!r}: "
+                f"Unsupported Qwen3-VL {variant} tensor shape for {key!r}: "
                 f"expected {expected_shape}, got {actual_shape}."
             )
-    for key, expected_shape in QWEN3VL_VISUAL_SIGNATURE_SHAPES.items():
+    for key, expected_shape in matches[0]["visual_shapes"].items():
         if key not in state_dict or tuple(state_dict[key].shape) != expected_shape:
             actual_shape = tuple(state_dict[key].shape) if key in state_dict else None
             raise ValueError(
-                f"Unsupported Qwen3-VL 4B visual signature for {key!r}: "
+                f"Unsupported Qwen3-VL {variant} visual signature for {key!r}: "
                 f"expected {expected_shape}, got {actual_shape}."
             )
 
@@ -699,10 +769,12 @@ def normalize_qwen3vl_state_dict(state_dict):
         for key, value in state_dict.items()
         if key.startswith(QWEN3VL_SOURCE_PREFIX)
     )
-    return SourceStateDict(
+    normalized = SourceStateDict(
         map_qwen3_state_dict(hf_state_dict).items(),
         architecture_hint="qwen3vl",
     )
+    normalized.qwen3vl_variant = variant
+    return normalized
 
 
 def normalize_source_state_dict(state_dict):
@@ -716,10 +788,28 @@ def normalize_source_state_dict(state_dict):
     )
 
 
+def _qwen3vl_arch(variant=None):
+    """A ModelQwen3VL carrying the checkpoint size to record in the GGUF metadata."""
+    model_arch = ModelQwen3VL()
+    if variant is None:
+        raise ValueError(
+            "Qwen3-VL source did not report its size; cannot choose between "
+            "the supported variants."
+        )
+    supported = {spec["variant"] for spec in qwen3vl_variant_specs()}
+    if variant not in supported:
+        raise ValueError(
+            f"Unsupported Qwen3-VL variant {variant!r}; "
+            f"supported variants: {', '.join(sorted(supported))}."
+        )
+    model_arch.qwen3vl_variant = variant
+    return model_arch
+
+
 def validate_qwen3vl_quantization(model_arch, quant_type_name, max_size_mb):
     if model_arch.arch == "qwen3vl" and (quant_type_name != "Q8_CR" or max_size_mb is not None):
         raise ValueError(
-            "Qwen3-VL 4B BF16 conversion is currently supported only as a text-only "
+            "Qwen3-VL 4B/8B BF16 conversion is currently supported only as a text-only "
             "Q8_CR GGUF. Select Q8_CR and leave max_size_mb unset."
         )
 
@@ -727,7 +817,10 @@ def validate_qwen3vl_quantization(model_arch, quant_type_name, max_size_mb):
 def add_model_metadata(writer, model_arch):
     if model_arch.arch == "qwen3vl":
         writer.add_bool(QWEN3VL_TEXT_ONLY_METADATA, True)
-        writer.add_string(QWEN3VL_VARIANT_METADATA, "4b")
+        writer.add_string(
+            QWEN3VL_VARIANT_METADATA,
+            model_arch.qwen3vl_variant,
+        )
 
 
 def is_model_arch(model, state_dict):
@@ -751,14 +844,14 @@ def is_model_arch(model, state_dict):
 def detect_arch(state_dict):
     architecture_hint = getattr(state_dict, "architecture_hint", None)
     if architecture_hint == "qwen3vl":
-        return ModelQwen3VL()
+        return _qwen3vl_arch(getattr(state_dict, "qwen3vl_variant", None))
     if architecture_hint is not None:
         raise ValueError(f"Unknown source architecture hint: {architecture_hint!r}.")
 
     if any(key.startswith(QWEN3VL_SOURCE_PREFIX) for key in state_dict):
         normalized = normalize_qwen3vl_state_dict(state_dict)
         if normalized is not None:
-            return ModelQwen3VL()
+            return _qwen3vl_arch(getattr(normalized, "qwen3vl_variant", None))
 
     model_arch = None
     for arch in arch_list:
@@ -1602,7 +1695,7 @@ def parse_args():
         choices=list(QUANT_TYPE_MAP.keys()),
         default=None,
         help=(
-            "Target quantization type for eligible 2-D+ tensors. Qwen3-VL 4B BF16 "
+            "Target quantization type for eligible 2-D+ tensors. Qwen3-VL 4B/8B BF16 "
             "conversion currently requires Q8_CR and produces a text-only encoder. "
             "Raw Q4_K/Q5_K/Q6_K are uniform; Q4_K_S/Q4_K_M/Q5_K_S/Q5_K_M are "
             "deterministic mixed presets. 1-D biases/scales stay F32. Defaults to "

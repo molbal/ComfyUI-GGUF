@@ -1162,7 +1162,7 @@ class CLIPLoaderGGUF:
                     and "int8_tensorwise" in extra.get("gguf_quant_formats", ())
                 ):
                     raise RuntimeError(
-                        "Qwen3-VL 4B Q8_CR text encoders require CLIPLoaderGGUFDynamicVRAM. "
+                        "Qwen3-VL text-only Q8_CR text encoders require CLIPLoaderGGUFDynamicVRAM. "
                         "Use the single-CLIP Dynamic VRAM loader for native INT8 or its safe fallback."
                     )
             else:
@@ -1261,14 +1261,14 @@ def _prune_qwen3vl_vision(clip):
     transformer = next(
         (
             module for module in model.modules()
-            if getattr(module, "model_type", None) == "qwen3vl_4b"
+            if getattr(module, "model_type", None) in ("qwen3vl_4b", "qwen3vl_8b")
             and hasattr(module, "visual")
         ),
         None,
     ) if model is not None and hasattr(model, "modules") else None
     if transformer is None:
         raise RuntimeError(
-            "The text-only Qwen3-VL GGUF was not loaded as a Qwen3-VL 4B model; "
+            "The text-only Qwen3-VL GGUF was not loaded as a Qwen3-VL text encoder; "
             "cannot safely disable its vision tower."
         )
     if getattr(transformer, "visual", None) is not None:
@@ -1282,7 +1282,7 @@ def _prune_qwen3vl_vision(clip):
         return None, None
 
     transformer.preprocess_embed = reject_image_embed
-    logging.info("Qwen3-VL 4B Q8_CR: disabled the unused vision tower; image input is rejected.")
+    logging.info("Qwen3-VL text-only Q8_CR: disabled the unused vision tower; image input is rejected.")
 
 
 def _load_dynamic_gguf_clip(
@@ -1311,7 +1311,7 @@ def _load_dynamic_gguf_clip(
             if extra.get("qwen3vl_text_only"):
                 if len(clip_paths) != 1:
                     raise ValueError(
-                        "The text-only Qwen3-VL 4B Q8_CR encoder must be loaded by itself."
+                        "The text-only Qwen3-VL Q8_CR encoder must be loaded by itself."
                     )
                 if "int8_tensorwise" not in extra.get("gguf_quant_formats", ()):
                     raise ValueError(
@@ -1333,7 +1333,7 @@ def _load_dynamic_gguf_clip(
                             "Qwen3-VL text-only GGUF contains no materializable Q8_CR Linear weights."
                         )
                     logging.warning(
-                        "Qwen3-VL 4B Q8_CR: native INT8 was not selected (%s); "
+                        "Qwen3-VL text-only Q8_CR: native INT8 was not selected (%s); "
                         "restored %d ConvRot weight(s) for dequantized higher-precision execution.",
                         qwen3vl_native_reason,
                         restored,
@@ -1341,7 +1341,7 @@ def _load_dynamic_gguf_clip(
                 else:
                     device, capability = qwen3vl_native_device
                     logging.info(
-                        "Qwen3-VL 4B Q8_CR: selecting native TensorWiseINT8 ConvRot on %s "
+                        "Qwen3-VL text-only Q8_CR: selecting native TensorWiseINT8 ConvRot on %s "
                         "(compute capability %d.%d).",
                         device,
                         capability[0],

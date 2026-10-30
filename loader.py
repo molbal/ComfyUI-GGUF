@@ -18,6 +18,9 @@ VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 RAW_BYTE_TENSOR_KEYS = frozenset(("tokenizer_json", "spiece_model", "tekken_model"))
 QWEN3VL_TEXT_ONLY_METADATA = "comfy.gguf.qwen3vl.text_only"
 QWEN3VL_VARIANT_METADATA = "comfy.gguf.qwen3vl.variant"
+# Sizes this pack's converter can emit a text-only Q8_CR file for, and that the
+# loader therefore accepts that metadata on.
+QWEN3VL_TEXT_ONLY_VARIANTS = ("4b", "8b")
 GGUF_FLOAT32_TYPE = getattr(
     gguf.GGUFValueType,
     "FLOAT32",
@@ -1122,10 +1125,12 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None, return_extra=F
     metadata = extra.get("metadata", {})
     qwen3vl_text_only = metadata.get(QWEN3VL_TEXT_ONLY_METADATA) is True
     if qwen3vl_text_only and (
-        arch != "qwen3vl" or metadata.get(QWEN3VL_VARIANT_METADATA) != "4b"
+        arch != "qwen3vl"
+        or metadata.get(QWEN3VL_VARIANT_METADATA) not in QWEN3VL_TEXT_ONLY_VARIANTS
     ):
         raise ValueError(
-            "Qwen3-VL text-only metadata is valid only on a Qwen3-VL 4B GGUF."
+            "Qwen3-VL text-only metadata is valid only on a Qwen3-VL "
+            f"{' or '.join(QWEN3VL_TEXT_ONLY_VARIANTS)} GGUF."
         )
     extra["qwen3vl_text_only"] = qwen3vl_text_only
     if arch == "minimax_music3" and "tokenizer_json" in sd:

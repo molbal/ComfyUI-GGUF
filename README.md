@@ -82,6 +82,10 @@ This node pack includes a GGUF converter. It has 3 possible interfaces that you 
 
 Each option is documented here: [Quantizing models](https://molbal.github.io/gguf/ecosystem/quantizing-models.html)
 
+Official Qwen3-VL 4B and 8B BF16 checkpoints convert only to a text-only
+`Q8_CR` text-encoder GGUF; its `comfy.gguf.qwen3vl.variant` field records
+which size it came from.
+
 ## Supported Conversion Formats
 
 | Format | Storage / execution       | Recommended use                                             |

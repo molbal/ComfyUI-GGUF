@@ -2576,7 +2576,7 @@ class Qwen3VLConverterTests(unittest.TestCase):
             incompatible["model.language_model.unexpected.weight"] = torch.ones(
                 (1,), dtype=torch.bfloat16
             )
-            with self.assertRaisesRegex(ValueError, "official Qwen3-VL 4B BF16 checkpoint"):
+            with self.assertRaisesRegex(ValueError, "official Qwen3-VL 4B or 8B BF16 checkpoint"):
                 normalize_qwen3vl_state_dict(incompatible)
 
     def test_rejects_other_quantizers_for_qwen3vl(self):
@@ -2589,6 +2589,147 @@ class Qwen3VLConverterTests(unittest.TestCase):
                     quant_type_name="Q4_0",
                     quantization_device="cpu",
                 )
+
+    def synthetic_8b_layout(self):
+        """Sparse stand-in for an official Qwen3-VL 8B checkpoint (same key layout)."""
+        language_shapes = {
+            f"{QWEN3VL_SOURCE_PREFIX}embed_tokens.weight": (32, 512),
+            f"{QWEN3VL_SOURCE_PREFIX}norm.weight": (512,),
+            f"{QWEN3VL_SOURCE_PREFIX}layers.0.input_layernorm.weight": (512,),
+            f"{QWEN3VL_SOURCE_PREFIX}layers.0.post_attention_layernorm.weight": (512,),
+            f"{QWEN3VL_SOURCE_PREFIX}layers.0.self_attn.k_norm.weight": (128,),
+            f"{QWEN3VL_SOURCE_PREFIX}layers.0.self_attn.q_norm.weight": (128,),
+            f"{QWEN3VL_SOURCE_PREFIX}layers.0.self_attn.q_proj.weight": (16, 512),
+            f"{QWEN3VL_SOURCE_PREFIX}layers.0.self_attn.k_proj.weight": (4, 512),
+            f"{QWEN3VL_SOURCE_PREFIX}layers.0.self_attn.v_proj.weight": (4, 512),
+            f"{QWEN3VL_SOURCE_PREFIX}layers.0.self_attn.o_proj.weight": (512, 16),
+            f"{QWEN3VL_SOURCE_PREFIX}layers.0.mlp.gate_proj.weight": (1024, 512),
+            f"{QWEN3VL_SOURCE_PREFIX}layers.0.mlp.up_proj.weight": (1024, 512),
+            f"{QWEN3VL_SOURCE_PREFIX}layers.0.mlp.down_proj.weight": (512, 1024),
+            f"{QWEN3VL_SOURCE_PREFIX}layers.35.self_attn.q_proj.weight": (16, 512),
+        }
+        visual_shapes = {
+            f"{QWEN3VL_VISUAL_PREFIX}patch_embed.proj.weight": (6, 3, 2, 4, 4),
+            f"{QWEN3VL_VISUAL_PREFIX}pos_embed.weight": (16, 6),
+            f"{QWEN3VL_VISUAL_PREFIX}blocks.0.attn.qkv.weight": (18, 6),
+            f"{QWEN3VL_VISUAL_PREFIX}blocks.26.attn.qkv.weight": (18, 6),
+            f"{QWEN3VL_VISUAL_PREFIX}merger.linear_fc2.weight": (16, 24),
+            f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.0.norm.weight": (24,),
+            f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.2.linear_fc2.weight": (16, 24),
+        }
+        state_dict = OrderedDict(
+            (key, torch.ones(shape, dtype=torch.bfloat16))
+            for key, shape in (*language_shapes.items(), *visual_shapes.items())
+        )
+        return language_shapes, visual_shapes, state_dict
+
+    def layout_patches_8b(self, language_shapes, visual_shapes):
+        return mock.patch.multiple(
+            converter,
+            QWEN3VL_8B_LANGUAGE_SHAPES=language_shapes,
+            QWEN3VL_8B_VISUAL_SIGNATURE_SHAPES=visual_shapes,
+            QWEN3VL_8B_SOURCE_LANGUAGE_TENSOR_COUNT=len(language_shapes),
+            QWEN3VL_8B_SOURCE_VISUAL_TENSOR_COUNT=len(visual_shapes),
+            QWEN3VL_8B_SOURCE_TENSOR_COUNT=len(language_shapes) + len(visual_shapes),
+        )
+
+    def test_recognizes_and_converts_8b_source_to_text_only_q8_cr(self):
+        language_shapes, visual_shapes, source = self.synthetic_8b_layout()
+        with self.layout_patches_8b(language_shapes, visual_shapes):
+            self.assertIsInstance(detect_arch(source), ModelQwen3VL)
+            normalized = normalize_qwen3vl_state_dict(source)
+            self.assertIsInstance(normalized, SourceStateDict)
+            self.assertEqual(normalized.qwen3vl_variant, "8b")
+            model_arch = detect_arch(normalized)
+            self.assertIsInstance(model_arch, ModelQwen3VL)
+            self.assertEqual(model_arch.qwen3vl_variant, "8b")
+
+            with TemporaryDirectory() as temp_dir:
+                output_path = Path(temp_dir) / "qwen3vl-8b-Q8_CR.gguf"
+                convert_state_dict(
+                    source,
+                    str(output_path),
+                    quant_type_name="Q8_CR",
+                    quantization_device="cpu",
+                )
+                reader = gguf.GGUFReader(str(output_path))
+                tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+                metadata = load_gguf_loader().get_gguf_metadata(reader)
+                reader.tensors.clear()
+                reader.fields.clear()
+                reader.data._mmap.close()
+                del reader
+
+        self.assertTrue(metadata[QWEN3VL_TEXT_ONLY_METADATA])
+        self.assertEqual(metadata[QWEN3VL_VARIANT_METADATA], "8b")
+        self.assertEqual(
+            tensor_types["blk.0.attn_q.weight"], gguf.GGMLQuantizationType.I8
+        )
+        self.assertFalse(any(name.startswith("model.visual.") for name in tensor_types))
+
+    def test_rejects_qwen3vl_hint_without_a_detected_variant(self):
+        # A hand-built SourceStateDict may carry the qwen3vl hint without ever
+        # going through normalize_qwen3vl_state_dict, so no size was detected.
+        # Guessing a variant would stamp the GGUF with the wrong size.
+        state_dict = SourceStateDict(
+            [("blk.0.attn_q.weight", torch.ones((4, 4), dtype=torch.bfloat16))],
+            architecture_hint="qwen3vl",
+        )
+        with self.assertRaisesRegex(ValueError, "did not report its size"):
+            detect_arch(state_dict)
+
+    def test_rejects_a_layout_mixing_the_two_sizes(self):
+        language_shapes, visual_shapes, source = synthetic_qwen3vl_layout()
+        mixed = OrderedDict(source)
+        mixed[f"{QWEN3VL_VISUAL_PREFIX}blocks.26.attn.qkv.weight"] = torch.ones(
+            (12, 4), dtype=torch.bfloat16
+        )
+        with self.layout_patches(language_shapes, visual_shapes):
+            with self.assertRaisesRegex(
+                ValueError, "tensor counts differ from the official Qwen3-VL layouts"
+            ):
+                normalize_qwen3vl_state_dict(mixed)
+
+    def test_8b_tables_match_the_measured_official_checkpoint_layout(self):
+        language = converter.QWEN3VL_8B_LANGUAGE_SHAPES
+        visual = converter.QWEN3VL_8B_VISUAL_SIGNATURE_SHAPES
+        self.assertEqual(
+            len(language), converter.QWEN3VL_8B_SOURCE_LANGUAGE_TENSOR_COUNT
+        )
+        self.assertEqual(
+            converter.QWEN3VL_8B_SOURCE_TENSOR_COUNT
+            - converter.QWEN3VL_8B_SOURCE_LANGUAGE_TENSOR_COUNT,
+            converter.QWEN3VL_8B_SOURCE_VISUAL_TENSOR_COUNT,
+        )
+        # 4B and 8B share one language key set; only the dimensions differ.
+        self.assertEqual(
+            set(language), set(converter.QWEN3VL_LANGUAGE_SHAPES)
+        )
+        self.assertEqual(
+            language[f"{QWEN3VL_SOURCE_PREFIX}embed_tokens.weight"], (151936, 4096)
+        )
+        self.assertEqual(
+            language[f"{QWEN3VL_SOURCE_PREFIX}layers.35.self_attn.k_proj.weight"],
+            (1024, 4096),
+        )
+        self.assertEqual(
+            language[f"{QWEN3VL_SOURCE_PREFIX}layers.35.mlp.down_proj.weight"],
+            (4096, 12288),
+        )
+        self.assertEqual(
+            visual[f"{QWEN3VL_VISUAL_PREFIX}patch_embed.proj.weight"],
+            (1152, 3, 2, 16, 16),
+        )
+        self.assertEqual(
+            visual[f"{QWEN3VL_VISUAL_PREFIX}blocks.0.attn.qkv.weight"], (3456, 1152)
+        )
+        self.assertEqual(
+            visual[f"{QWEN3VL_VISUAL_PREFIX}merger.linear_fc2.weight"], (4096, 4608)
+        )
+        self.assertEqual(
+            visual[f"{QWEN3VL_VISUAL_PREFIX}deepstack_merger_list.0.norm.weight"],
+            (4608,),
+        )
 
 
 class Qwen3VLNativeOpsTests(unittest.TestCase):
@@ -2686,6 +2827,24 @@ class Qwen3VLLoaderRoutingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "text-only and does not support image inputs"):
             wrapper.qwen3vl.preprocess_embed({"type": "image"}, device=torch.device("cpu"))
 
+    def test_prunes_vision_tower_of_the_8b_text_encoder(self):
+        class Qwen3VL8BFake(torch.nn.Module):
+            model_type = "qwen3vl_8b"
+
+            def __init__(self):
+                super().__init__()
+                self.visual = torch.nn.Linear(2, 2)
+
+        wrapper = torch.nn.Module()
+        wrapper.qwen3vl = Qwen3VL8BFake()
+        clip = type("Clip", (), {"cond_stage_model": wrapper})()
+
+        self.nodes._prune_qwen3vl_vision(clip)
+
+        self.assertIsNone(wrapper.qwen3vl.visual)
+        with self.assertRaisesRegex(ValueError, "text-only and does not support image inputs"):
+            wrapper.qwen3vl.preprocess_embed({"type": "image"}, device=torch.device("cpu"))
+
     def test_ampere_feature_probe_selects_tensorwise_int8(self):
         with mock.patch.object(
             self.nodes.comfy.model_management,
@@ -2775,6 +2934,65 @@ class Qwen3VLDetectionMarkerTests(unittest.TestCase):
         self.assertTrue(extra["qwen3vl_text_only"])
         self.assertIn("model.visual.deepstack_merger_list.0.norm.weight", state_dict)
         mmproj_loader.assert_not_called()
+
+    def test_text_only_metadata_is_accepted_for_the_8b_variant(self):
+        with mock.patch.object(
+            self.loader,
+            "gguf_sd_loader",
+            return_value=(
+                {
+                    "model.layers.0.input_layernorm.weight": torch.zeros(4096),
+                    "blk.0.attn_q.weight": torch.zeros((8, 4096), dtype=torch.int8),
+                },
+                {
+                    "arch_str": "qwen3vl",
+                    "metadata": {
+                        "comfy.gguf.qwen3vl.text_only": True,
+                        "comfy.gguf.qwen3vl.variant": "8b",
+                    },
+                    "gguf_quant_formats": frozenset({"int8_tensorwise"}),
+                },
+            ),
+        ), mock.patch.object(
+            self.loader,
+            "gguf_mmproj_loader",
+            return_value={},
+        ) as mmproj_loader:
+            state_dict, extra = self.loader.gguf_clip_loader(
+                "qwen3vl-8b-text-only.gguf",
+                return_extra=True,
+            )
+
+        self.assertTrue(extra["qwen3vl_text_only"])
+        self.assertEqual(
+            state_dict["model.visual.merger.linear_fc2.weight"].shape, (4096, 4608)
+        )
+        mmproj_loader.assert_not_called()
+
+    def test_text_only_metadata_is_rejected_for_an_unsupported_variant(self):
+        with mock.patch.object(
+            self.loader,
+            "gguf_sd_loader",
+            return_value=(
+                {
+                    "model.layers.0.input_layernorm.weight": torch.zeros(5120),
+                    "blk.0.attn_q.weight": torch.zeros((8, 5120), dtype=torch.int8),
+                },
+                {
+                    "arch_str": "qwen3vl",
+                    "metadata": {
+                        "comfy.gguf.qwen3vl.text_only": True,
+                        "comfy.gguf.qwen3vl.variant": "32b",
+                    },
+                    "gguf_quant_formats": frozenset({"int8_tensorwise"}),
+                },
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "text-only metadata is valid only on a Qwen3-VL 4b or 8b GGUF",
+            ):
+                self.loader.gguf_clip_loader("qwen3vl-32b-text-only.gguf")
 
     def test_pruned_32b_clip_loader_injects_marker(self):
         with mock.patch.object(
