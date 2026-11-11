@@ -1070,7 +1070,8 @@ def get_gguf_q4_w4a4_ops(
                             "quant_group_size": params.quant_group_size,
                             "linear_dtype": "int8",
                         },
-                    ) == "cuda"
+                    # ROCm builds report device type "cuda" but run comfy_kitchen's HIP backend.
+                    ) in {"cuda", "hip"}
                 except Exception:
                     return False
 
