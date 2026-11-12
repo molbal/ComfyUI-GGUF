@@ -1171,6 +1171,9 @@ def gguf_clip_loader(path, dynamic=False, progress_callback=None, return_extra=F
             logging.warning(f"Dequantizing {QWEN35_COMFY_EMBED_KEY} to prevent runtime OOM.")
             sd[QWEN35_COMFY_EMBED_KEY] = dequantize_tensor(sd[QWEN35_COMFY_EMBED_KEY], dtype=torch.float16)
         dequantize_raw_lm_head(sd)
+        if not any(key.startswith(("model.visual.", "visual.")) for key in sd):
+            # No embedded vision tower: use the mmproj sidecar, as the llama.cpp branch does.
+            sd.update(gguf_mmproj_loader(path))
     elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "qwen35", "gemma3", "gemma4"}:
         # TODO: pass model_options["vocab_size"] to loader somehow
         temb_key = "token_embd.weight"

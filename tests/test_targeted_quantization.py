@@ -5504,6 +5504,17 @@ class Qwen35PreconvertedTextEncoderTests(unittest.TestCase):
         torch.testing.assert_close(loaded[prefix + "input_layernorm.weight"], norm)
         torch.testing.assert_close(loaded[prefix + "linear_attn.A_log"], a_log)
         torch.testing.assert_close(loaded["lm_head.weight"], lm_head)
+        # no embedded vision tower, so the mmproj sidecar is consulted like on the llama.cpp path
+        mmproj_loader.assert_called_once_with("qwen35-te-comfy-keys.gguf")
+
+    def test_embedded_vision_tower_skips_the_mmproj_sidecar(self):
+        visual = torch.randn(4, 4)
+        loaded, mmproj_loader = self._load({
+            "model.language_model.embed_tokens.weight": torch.randn(8, 4),
+            "model.visual.blocks.0.attn.proj.weight": visual.clone(),
+        })
+
+        torch.testing.assert_close(loaded["model.visual.blocks.0.attn.proj.weight"], visual)
         mmproj_loader.assert_not_called()
 
     def test_quantized_embedding_and_lm_head_are_dequantized(self):
